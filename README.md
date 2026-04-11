@@ -63,6 +63,12 @@ Built on [Übersicht](http://tracesof.net/ubersicht/). Two stacked bars
   windows rolling over at the 5-hour boundary are detected and
   reset to 0% automatically. It will **never** paint a red error
   splash across your menu bar.
+- **Never dark:** a launchd watchdog
+  (`com.ubersicht.keepalive`, installed by `install.sh`) keeps
+  Übersicht itself running. If it crashes, you Cmd-Q it by accident,
+  or you reboot, it's back within ~10 seconds with no manual
+  intervention. The widget being "always visible" isn't a hope, it's
+  an enforced invariant.
 
 #### Weekly quota detail popover
 
@@ -330,6 +336,17 @@ show the weekly bar in that case.
 No. Reads only. The OAuth token is read from the macOS keychain with
 `security find-generic-password`. The JSONL files are read-only-mmap'd
 during backfill.
+
+**What happens if Übersicht itself crashes or I accidentally quit it?**
+`install.sh` registers a launchd watchdog
+(`~/Library/LaunchAgents/com.ubersicht.keepalive.plist`) with
+`KeepAlive=true` and `ThrottleInterval=10`. Any exit — crash, Cmd-Q,
+SIGKILL, reboot — gets relaunched within seconds. The throttle caps
+restart attempts at 6/min so a genuinely broken binary can't
+busy-loop. You can verify by running
+`pkill -9 -f /Applications/Übersicht.app/Contents/MacOS/Übersicht`
+and watching `pgrep -lf bersicht` — a new PID appears almost
+immediately.
 
 **Will it blow up my rate limits?**
 The widget refreshes every 60s but its render path never touches the
