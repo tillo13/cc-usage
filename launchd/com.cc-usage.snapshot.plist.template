@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ════════════════════════════════════════════════════════════════════
+     cc-usage launchd agent — 15-minute API snapshot + JSONL backfill.
+
+     INSTALL:
+
+       1. Edit the two __TEMPLATE__ placeholders below:
+            __PYTHON_BIN__    → absolute path to a Python 3 interpreter
+                                that has `requests` installed AND has
+                                macOS Full Disk Access granted.
+            __REPO_ROOT__     → absolute path to the cloned cc_usage repo.
+
+       2. Copy to your LaunchAgents dir and load it:
+
+            cp launchd/com.cc-usage.snapshot.plist.template \
+               ~/Library/LaunchAgents/com.cc-usage.snapshot.plist
+            launchctl bootstrap gui/$(id -u) \
+               ~/Library/LaunchAgents/com.cc-usage.snapshot.plist
+
+       3. Verify it's running:
+
+            launchctl list | grep cc-usage
+            tail -f /tmp/cc_usage_launchd.log
+
+     The agent polls every 15 minutes (96 snapshots/day, 672/week) —
+     plenty of resolution for --validate drift math and burn-rate pacing.
+     ──────────────────────────────────────────────────────────────── -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.cc-usage.snapshot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON_BIN__</string>
+        <string>__REPO_ROOT__/claude_code_usage.py</string>
+        <string>--snapshot-only</string>
+        <string>--source</string>
+        <string>launchd</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__REPO_ROOT__</string>
+
+    <!-- Fire every 15 min. 900s gives ~96 snapshots/day, 672/week — plenty of
+         resolution for --validate drift math and recent-burn pacing. -->
+    <key>StartInterval</key>
+    <integer>900</integer>
+
+    <!-- Also fire once immediately when the agent loads (login or launchctl load). -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Don't relaunch tight-loop on failure; the 15-min cadence retries naturally. -->
+    <key>KeepAlive</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/cc_usage_launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/cc_usage_launchd.log</string>
+
+    <!-- Background priority — snapshot never races with interactive work. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>Nice</key>
+    <integer>10</integer>
+</dict>
+</plist>
