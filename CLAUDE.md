@@ -46,6 +46,11 @@ A self-contained stack that
   token row, session ID, and project path in the user's usage history.
 - `launchd/com.cc-usage.snapshot.plist.template` — launchd agent
   template that polls every 15 min. See the README for install.
+- `launchd/com.ubersicht.keepalive.plist.template` — launchd watchdog
+  that starts Übersicht at login and restarts it within seconds of
+  any crash / Cmd-Q / forced kill. Non-negotiable for the widget to
+  qualify as "always-visible." Uses `KeepAlive=true`,
+  `ThrottleInterval=10`, `ProcessType=Interactive`.
 
 ## Wiring (user-installed, not tracked in repo)
 
@@ -53,6 +58,7 @@ A self-contained stack that
 |---|---|
 | Shell alias `cc-usage` | `~/.zshrc` (one line — `alias cc-usage="<python> <repo>/claude_code_usage.py"`) |
 | launchd 15-min snapshot | `~/Library/LaunchAgents/com.cc-usage.snapshot.plist` |
+| launchd Übersicht watchdog | `~/Library/LaunchAgents/com.ubersicht.keepalive.plist` |
 | Übersicht widget | `~/Library/Application Support/Übersicht/widgets/cc-usage.jsx` |
 
 All three reference absolute paths chosen by the user at install time.

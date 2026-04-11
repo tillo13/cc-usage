@@ -71,7 +71,25 @@ launchctl bootout "gui/$(id -u)/com.cc-usage.snapshot" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$LAUNCHD_DST"
 echo "  · launchd agent loaded (fires every 15 min, RunAtLoad=true)"
 
-# ── 4. Smoke test ───────────────────────────────────────────────────────
+# ── 4. Install the Übersicht keep-alive watchdog ────────────────────────
+# The widget is pointless if Übersicht itself isn't running. This agent
+# starts it at login and restarts it within seconds of any crash / Cmd-Q
+# / forced kill. No template substitution — the paths are stable on macOS.
+if [[ ! -d "/Applications/Übersicht.app" ]]; then
+    echo "! /Applications/Übersicht.app not found — skipping watchdog install"
+    echo "  Install Übersicht first:  brew install --cask ubersicht"
+    echo "  Then re-run this script."
+else
+    KEEPALIVE_DST="$HOME/Library/LaunchAgents/com.ubersicht.keepalive.plist"
+    cp "$REPO_ROOT/launchd/com.ubersicht.keepalive.plist.template" "$KEEPALIVE_DST"
+    echo "  · keep-alive plist written to $KEEPALIVE_DST"
+
+    launchctl bootout "gui/$(id -u)/com.ubersicht.keepalive" 2>/dev/null || true
+    launchctl bootstrap "gui/$(id -u)" "$KEEPALIVE_DST"
+    echo "  · Übersicht watchdog loaded (RunAtLoad + KeepAlive, restart ≤10s)"
+fi
+
+# ── 5. Smoke test ───────────────────────────────────────────────────────
 echo ""
 echo "→ smoke test: cc-usage --widget-json"
 "$PYTHON_BIN" "$REPO_ROOT/claude_code_usage.py" --widget-json | head -c 200

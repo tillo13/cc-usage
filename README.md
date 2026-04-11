@@ -231,7 +231,10 @@ That script will:
 3. Render and install the launchd agent at
    `~/Library/LaunchAgents/com.cc-usage.snapshot.plist`, then
    `launchctl bootstrap` it so it starts firing immediately
-4. Smoke-test the widget JSON payload end-to-end
+4. Install the Übersicht keep-alive watchdog at
+   `~/Library/LaunchAgents/com.ubersicht.keepalive.plist` so Übersicht
+   starts at login and auto-restarts within seconds of any crash / quit
+5. Smoke-test the widget JSON payload end-to-end
 
 Afterwards, add a shell alias for interactive CLI use:
 

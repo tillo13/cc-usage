@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- ════════════════════════════════════════════════════════════════════
+     Übersicht keep-alive watchdog.
+
+     WHY THIS EXISTS:
+
+     The cc-usage widget is only useful if Übersicht itself is running.
+     Without a watchdog, Übersicht stays dead across reboots (it is not
+     added to Login Items by default) and stays dead if the user ever
+     Cmd-Q's it accidentally. That defeats the entire point of an
+     "always-visible quota readout."
+
+     This agent:
+       · starts Übersicht at user login (RunAtLoad)
+       · restarts it within seconds if it crashes or is quit (KeepAlive)
+       · throttles restart attempts so a broken binary can't busy-loop
+       · runs as Interactive so the menu-bar UI gets real priority
+
+     No template placeholders — paths are fixed on macOS.
+
+     INSTALL:
+
+       1. Copy to your LaunchAgents dir and load it:
+
+            cp launchd/com.ubersicht.keepalive.plist.template \
+               ~/Library/LaunchAgents/com.ubersicht.keepalive.plist
+            launchctl bootstrap gui/$(id -u) \
+               ~/Library/LaunchAgents/com.ubersicht.keepalive.plist
+
+       2. Verify it's running:
+
+            launchctl list | grep ubersicht
+            pgrep -lf bersicht
+
+       3. Prove self-healing:
+
+            pkill -f /Applications/Übersicht.app/Contents/MacOS/Übersicht
+            sleep 12
+            pgrep -lf bersicht   # should show a NEW pid
+
+     UNINSTALL:
+
+            launchctl bootout gui/$(id -u)/com.ubersicht.keepalive
+            rm ~/Library/LaunchAgents/com.ubersicht.keepalive.plist
+     ──────────────────────────────────────────────────────────────── -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ubersicht.keepalive</string>
+
+    <!-- Point at the actual Mach-O binary inside the .app bundle, NOT
+         `open -a Übersicht`. `open` returns immediately, which launchd
+         would interpret as a successful exit and either stop relaunching
+         (SuccessfulExit=false semantics) or busy-loop. Running the binary
+         directly lets launchd observe the real process lifecycle. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Übersicht.app/Contents/MacOS/Übersicht</string>
+    </array>
+
+    <!-- Start it the moment the agent loads (user login, or `launchctl
+         bootstrap` from a shell). -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Unconditional restart on exit — crash, quit, or forced kill. -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- Never restart more than once per 10 s. If the binary is crashing
+         on startup, this caps us at 6 restart attempts per minute instead
+         of a tight loop that would drain battery and flood logs. -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- GUI menu-bar app: needs real interactive scheduling priority,
+         not background throttling. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/ubersicht_keepalive.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/ubersicht_keepalive.log</string>
+</dict>
+</plist>
