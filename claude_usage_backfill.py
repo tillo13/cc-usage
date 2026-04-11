@@ -32,6 +32,7 @@ import os
 import re
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Sibling import — see claude_code_usage.py for rationale.
@@ -396,24 +397,57 @@ def backfill(since=None, verbose=True):
 
     conn.execute("COMMIT")
 
-    # Post-pass: fill turns.duration_ms from system.turn_duration events
+    # Post-pass: fill turns.duration_ms from system.turn_duration events.
+    #
+    # Performance: naively this UPDATE has a `WHERE duration_ms IS NULL`
+    # and runs the correlated subquery against every such row in the
+    # table. On a DB with months of history and tens of thousands of
+    # historical turns that never matched a duration event (older CC
+    # versions didn't emit them), that's an O(N) subquery-per-row scan
+    # that spins at 100% CPU for minutes on a `--since 10m` incremental
+    # backfill — which is absurd since those 10 minutes of new rows are
+    # all we're trying to join. Scope the UPDATE to the same time window
+    # we just ingested so the join only runs against rows that could
+    # plausibly have new matching events.
     if verbose:
         print("post-pass: joining system.turn_duration → turns.duration_ms …")
-    updated = conn.execute(
+    if since is not None:
+        since_iso = (
+            datetime.fromtimestamp(time.time() - since, tz=timezone.utc).isoformat()
+        )
+        update_sql = """
+            UPDATE turns
+               SET duration_ms = (
+                   SELECT e.duration_ms
+                     FROM events e
+                    WHERE e.type = 'system'
+                      AND e.subtype = 'turn_duration'
+                      AND e.parent_uuid = turns.message_uuid
+                    ORDER BY e.ts ASC
+                    LIMIT 1
+               )
+             WHERE duration_ms IS NULL
+               AND ts >= ?
         """
-        UPDATE turns
-           SET duration_ms = (
-               SELECT e.duration_ms
-                 FROM events e
-                WHERE e.type = 'system'
-                  AND e.subtype = 'turn_duration'
-                  AND e.parent_uuid = turns.message_uuid
-                ORDER BY e.ts ASC
-                LIMIT 1
-           )
-         WHERE duration_ms IS NULL
-        """
-    ).rowcount
+        updated = conn.execute(update_sql, (since_iso,)).rowcount
+    else:
+        # Full scan (no --since): accept the long post-pass. Users who run
+        # an unbounded rescan already expect it to take minutes.
+        updated = conn.execute(
+            """
+            UPDATE turns
+               SET duration_ms = (
+                   SELECT e.duration_ms
+                     FROM events e
+                    WHERE e.type = 'system'
+                      AND e.subtype = 'turn_duration'
+                      AND e.parent_uuid = turns.message_uuid
+                    ORDER BY e.ts ASC
+                    LIMIT 1
+               )
+             WHERE duration_ms IS NULL
+            """
+        ).rowcount
     conn.commit()
 
     if verbose:

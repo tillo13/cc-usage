@@ -54,9 +54,14 @@ Built on [Übersicht](http://tracesof.net/ubersicht/). Two stacked bars
   signals critical state by underlining the number, not recoloring it
 - **A pulsing live dot** next to the last-updated timestamp — the only
   moving element in the widget, so you can tell at a glance it's live
-- **Graceful degradation:** when the API rate-limits you (429) or the
-  network blips, the widget silently falls back to the last-known
-  snapshot from your local DB. It will **never** paint a red error
+- **Never stale, never errors:** the widget keeps a locally-calibrated
+  `%-per-Mtoken` ratio and extrapolates session% and week% forward
+  from the last successful API snapshot using per-turn token burn
+  from your local SQLite — so when Anthropic rate-limits the
+  `/api/oauth/usage` endpoint for hours at a time (yes, that happens),
+  the widget still paints current-to-the-minute numbers. Session
+  windows rolling over at the 5-hour boundary are detected and
+  reset to 0% automatically. It will **never** paint a red error
   splash across your menu bar.
 
 #### Weekly quota detail popover
@@ -294,9 +299,15 @@ Key design decisions:
   failure never crashes the snapshot step (the more critical of the
   two), and the overlap is free because every row has a UNIQUE UUID.
 - **The widget talks to the DB, not the API.** Its 60-second render
-  loop reads the most recent `snapshots` row. Only when that row is
-  older than 20 minutes does it escalate to a live API call — so the
-  widget itself can't possibly trigger rate limits under normal use.
+  loop reads the most recent `snapshots` row as a calibration anchor,
+  then extrapolates session% and week% forward using turn-level token
+  burn and an empirically-fit `%-per-Mtoken` ratio. That means the
+  widget is always live-to-the-minute AND never hits the API on its
+  own render path — so it can't possibly contribute to rate limits.
+  The 15-min launchd agent is the only thing that actually touches
+  `/api/oauth/usage`, and when *that* gets 429'd, the extrapolation
+  simply keeps projecting forward from whatever the most recent
+  successful snapshot was.
 - **OAuth token is read-only, never refreshed.** Refreshing rotates
   the token and kicks the live Claude Code CLI back to `/login`. We
   deliberately avoid that code path and just re-read from keychain on
@@ -318,11 +329,16 @@ No. Reads only. The OAuth token is read from the macOS keychain with
 during backfill.
 
 **Will it blow up my rate limits?**
-The widget refreshes every 60s but reads from the local DB, not the
-API. The launchd agent polls the API every 15 minutes (96/day, 672/week)
-— well under any rate limit. And if you somehow do get 429'd, the
-widget silently falls back to the last-known DB snapshot. You will
-never see a red error bar.
+The widget refreshes every 60s but its render path never touches the
+API — it uses the local DB as a calibration anchor and extrapolates
+forward from per-turn token burn. Only the 15-min launchd agent
+actually polls `/api/oauth/usage` (96/day, 672/week), and that's well
+under any published limit. In practice Anthropic will *still*
+sometimes 429 you for hours at a time on this endpoint, and when that
+happens the widget just keeps extrapolating from the last successful
+snapshot — you'll see numbers that stay current to the minute even
+while the API is locking the launchd agent out. You will never see a
+red error bar.
 
 **Can I move the repo after install?**
 No — the widget, launchd plist, and shell alias all reference absolute

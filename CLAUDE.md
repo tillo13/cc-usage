@@ -94,11 +94,36 @@ var (any IANA zone name). Default is `America/Los_Angeles`.
 
 ## Widget failure policy
 
-The Übersicht widget must **never** paint a red error splash. The
-`--widget-json` path silently falls back to the last-known DB snapshot
-on any live-fetch failure (429, network, token refresh, etc.), and
-emits an empty payload only when there's literally no DB row to draw
-from — in which case the widget shows "loading…" instead of an error.
+The Übersicht widget must **never** paint a red error splash AND must
+**never** freeze on stale data. Two things keep both promises true:
+
+1. **No live API call on the render path.** `--widget-json` reads the
+   most recent `snapshots` row as a calibration anchor and extrapolates
+   session% / week% forward using local token burn × the empirical
+   `%-per-Mtoken` ratio (`_empirical_pct_per_mtok` + `_extrapolate_live`
+   in `claude_code_usage.py`). Session windows rolling over at the 5h
+   boundary are detected and rolled to 0% automatically via
+   `_roll_window_forward`.
+2. **Backfill stampede prevention.** The widget path also kicks a
+   short incremental backfill (`--since 10m`) so the `turns` table has
+   the latest JSONL rows before extrapolation runs. Concurrent backfill
+   processes would deadlock each other on the SQLite write lock, so
+   every caller (widget + launchd agent) must first call
+   `_acquire_backfill_lock(max_age_sec=...)` — a mtime-based lockfile
+   at `data/.backfill.lock` that ensures at most one backfill is in
+   flight at a time and rate-limits restarts.
+
+Error policy: only when there is *no* snapshot row at all (cold start,
+brand new DB) does `--widget-json` emit `{}` so the JSX shows
+"loading…". Every other path must produce a fresh, numerically
+coherent payload — no tracebacks, no live-fetch bypass, no red errors.
 
 This is intentional and documented in the code. Don't add error
-surfacing to the widget render path.
+surfacing to the widget render path. If you think the widget should
+paint an error, you're wrong — extend the extrapolation instead.
+
+The `--snapshot-only` launchd path ALSO must survive API failures
+without killing the backfill half. The snapshot insert and the
+incremental backfill are independent: an API 429 storm (hours long,
+Retry-After: 0, no useful retry hint) must not freeze the turns
+table, because the turns table is what keeps the extrapolation alive.

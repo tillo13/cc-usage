@@ -838,6 +838,10 @@ def print_panel(
     # snapshot on any error (429, network, token refresh, etc.). Matches the
     # widget's fallback policy — transient API issues should never crash the
     # panel, and a slightly stale snapshot is always better than a traceback.
+    # When we do fall back, we also run the same live-extrapolation the
+    # widget uses so the CLI and widget stay numerically consistent — no
+    # "widget says 45%, cc-usage says 39%" skew just because the API is
+    # refusing us right now.
     live_fetched = False
     if data is None:
         try:
@@ -857,10 +861,30 @@ def print_panel(
                     age_str = (
                         f"{int(age_min)}m old" if age_min is not None else "stale"
                     )
-                    print(
-                        f"  ⚠  live fetch failed ({type(e).__name__}); "
-                        f"showing last DB snapshot ({age_str})"
-                    )
+                    _extrapolate_live(conn, data, row["ts"])
+                    extra_info = data.get("_extrapolated") or {}
+                    week_info = extra_info.get("week") or {}
+                    session_info = extra_info.get("session") or {}
+                    if week_info.get("applied") or session_info.get("applied"):
+                        bits = []
+                        if session_info.get("applied"):
+                            bits.append(
+                                f"session +{session_info.get('delta_pct', 0):.1f}%"
+                            )
+                        if week_info.get("applied"):
+                            bits.append(
+                                f"week +{week_info.get('delta_pct', 0):.1f}%"
+                            )
+                        detail = " · ".join(bits)
+                        print(
+                            f"  ⚠  live fetch failed ({type(e).__name__}); "
+                            f"anchor {age_str}, extrapolated from turns ({detail})"
+                        )
+                    else:
+                        print(
+                            f"  ⚠  live fetch failed ({type(e).__name__}); "
+                            f"showing last DB snapshot ({age_str})"
+                        )
                 except Exception:
                     raise e
             else:
@@ -1313,6 +1337,248 @@ def _live_session_stats(window_min=15):
     return ls[0] if ls else None
 
 
+# ---------- backfill throttle ----------
+#
+# Multiple processes can try to run the JSONL backfill simultaneously:
+# the 15-min launchd agent, the widget's 60-s render loop, and an
+# interactive `cc-usage` invocation from the shell. SQLite's 30-second
+# busy_timeout handles brief contention but a full backfill holds the
+# write lock long enough for stampedes to deadlock each other.
+#
+# Fix: a mtime-based lockfile at data/.backfill.lock. Any caller that
+# wants to trigger a backfill first tries _acquire_backfill_lock(max_age);
+# a fresh lockfile (mtime newer than max_age seconds) means "someone
+# else just did this / is doing this — skip", and we return False. On
+# success we touch the lockfile and return True, so the lock is
+# effectively held until max_age seconds from now even if the caller
+# crashes. That's intentional — we'd rather skip an extra backfill than
+# pile up concurrent ones.
+
+def _acquire_backfill_lock(max_age_sec=90):
+    """Return True if the caller should run a backfill, False otherwise.
+
+    Checks the lockfile's mtime; if it's older than max_age_sec (or the
+    lockfile doesn't exist), touches it to claim the slot and returns
+    True. If the lockfile is fresher, someone else just ran (or is
+    currently running) a backfill and the caller should skip.
+    """
+    import time as _time
+    lock_path = Path(__file__).resolve().parent / "data" / ".backfill.lock"
+    now = _time.time()
+    try:
+        mtime = lock_path.stat().st_mtime
+        if now - mtime < max_age_sec:
+            return False
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # If we can't stat the lock for any other reason, err on the
+        # side of letting one backfill through — worse to silently stall
+        # forever than to run a spurious backfill.
+        pass
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.touch()
+    except OSError:
+        pass
+    return True
+
+
+# ---------- live extrapolation ----------
+#
+# Problem: /api/oauth/usage rate-limits us for hours at a time (429 with
+# Retry-After: 0 and no meaningful retry hint). When that happens, the
+# launchd poller can't write new snapshots and the widget would otherwise
+# freeze on a multi-hour-old reading. The CLAUDE.md widget policy is
+# "never paint a red error splash", but that used to silently degrade to
+# "never paint fresh numbers" whenever Anthropic locked us out.
+#
+# Fix: keep the last successful snapshot as a calibration anchor and
+# extrapolate forward using local token burn from the `turns` table.
+# Anthropic reports quota utilization in whole %, so any small interval
+# has 0.5% rounding noise — but aggregated across the current window it
+# fits a stable Δ% = k × Δ(tokens / 1M) ratio (confirmed empirically).
+#
+# Session windows reset every 5h: when the anchor's reset_at has passed
+# we roll forward into the new window (anchor% = 0, starting at the old
+# reset boundary) and only count tokens from that boundary. Multi-window
+# rollovers are handled by walking forward one window at a time.
+#
+# Result: the widget paints fresh-to-this-minute numbers that close the
+# gap between "last snapshot we could pull" and "right now", with zero
+# network dependency. The API snapshot remains the source of truth;
+# extrapolation is a forward projection from it.
+
+def _bucket_reset(iso_ts):
+    """Normalize an Anthropic reset_at timestamp to its hour.
+
+    Anthropic stamps /api/oauth/usage resets with sub-second jitter even
+    when the logical window hasn't changed (`...T13:00:00.452766+00:00` vs
+    `...T13:00:00.518053+00:00`). Bucketing to `YYYY-MM-DDTHH` gives us a
+    stable grouping key so snapshots within the same weekly/session
+    window can be treated as comparable.
+    """
+    if not iso_ts:
+        return None
+    return iso_ts[:13]
+
+
+def _empirical_pct_per_mtok(conn, kind):
+    """Empirical %-per-Mtok conversion for the current window.
+
+    kind: "session" (five_hour) or "week" (seven_day).
+
+    Returns `(last_pct - first_pct) / Σ Mtok(first_ts..last_ts)` across the
+    most recent snapshot window. Full-span aggregate is deliberate: any
+    pair-wise aggregation that drops intervals with dp==0 inflates the
+    ratio, because Anthropic reports utilization rounded to whole % — those
+    flat intervals still consumed tokens, so dropping them discards real
+    denominator mass and overstates pct/Mtok.
+
+    If the current window has fewer than 2 snapshots, falls back to the
+    previous window. Returns None when no window has a usable pair —
+    callers MUST skip extrapolation in that case rather than guess.
+    """
+    pct_col, reset_col = {
+        "session": ("five_hour_pct", "five_hour_reset"),
+        "week":    ("seven_day_pct", "seven_day_reset"),
+    }[kind]
+
+    rows = conn.execute(
+        f"SELECT ts, {pct_col} AS pct, {reset_col} AS reset "
+        f"FROM snapshots WHERE {pct_col} IS NOT NULL "
+        f"ORDER BY ts DESC LIMIT 2000"
+    ).fetchall()
+    if len(rows) < 2:
+        return None
+
+    # Group newest→oldest by normalized reset bucket. A new group starts
+    # whenever the bucket key changes, so groups[0] is the current window,
+    # groups[1] is the window before, etc.
+    groups = []
+    cur_bucket = object()  # sentinel — never matches a real bucket
+    for r in rows:
+        b = _bucket_reset(r["reset"])
+        if b != cur_bucket:
+            groups.append([])
+            cur_bucket = b
+        groups[-1].append(r)
+
+    for grp in groups:
+        if len(grp) < 2:
+            continue
+        # grp is newest→oldest within one window; first = oldest, last = newest
+        first, last = grp[-1], grp[0]
+        dp = (last["pct"] or 0) - (first["pct"] or 0)
+        if dp <= 0:
+            continue  # window reset or flat — no usable signal this pass
+        tok_row = conn.execute(
+            "SELECT SUM(input_tokens + output_tokens + cache_creation_input_tokens) AS t "
+            "FROM turns WHERE ts > ? AND ts <= ?",
+            (first["ts"], last["ts"]),
+        ).fetchone()
+        tokens = tok_row["t"] or 0
+        if tokens <= 0:
+            continue
+        mtok = tokens / 1_000_000
+        return dp / mtok
+    return None
+
+
+def _tokens_since(conn, since_iso):
+    """Quota-counted tokens (input + output + cache_creation) since ts."""
+    row = conn.execute(
+        "SELECT SUM(input_tokens + output_tokens + cache_creation_input_tokens) AS t "
+        "FROM turns WHERE ts > ?",
+        (since_iso,),
+    ).fetchone()
+    return row["t"] or 0
+
+
+def _roll_window_forward(anchor_pct, anchor_ts_iso, reset_iso, window_hours):
+    """Fast-forward past any window boundaries between anchor and now.
+
+    If the anchor snapshot's window has ended, the current window starts
+    at the old reset time (anchor% = 0) and ends one window_hours later.
+    If many windows have elapsed (session = 5h, so 3+ can fit in a 15h
+    gap), walk forward until the reset is in the future.
+
+    Returns (effective_anchor_pct, effective_anchor_ts, effective_reset_iso).
+    When the window hasn't rolled, returns the inputs unchanged.
+    """
+    reset_dt = _parse_iso(reset_iso)
+    now = datetime.now(timezone.utc)
+    if not reset_dt or now < reset_dt:
+        return anchor_pct, anchor_ts_iso, reset_iso
+    while now >= reset_dt:
+        reset_dt = reset_dt + timedelta(hours=window_hours)
+    new_window_start_dt = reset_dt - timedelta(hours=window_hours)
+    return 0.0, new_window_start_dt.isoformat(), reset_dt.isoformat()
+
+
+def _extrapolate_live(conn, data, anchor_ts_iso):
+    """Advance a raw /api/oauth/usage dict to reflect live token burn.
+
+    `data` is the last snapshot's raw payload — possibly seconds old,
+    possibly hours old. We advance `five_hour.utilization` and
+    `seven_day.utilization` using the empirical pct-per-Mtok ratio and
+    the turns table, so the widget paints a reading that's current to
+    this minute even when the background API poll is being rate-limited.
+
+    Side effects on `data`:
+      - `five_hour.utilization` and `seven_day.utilization` bumped by the
+        extrapolated delta (clipped to [0, 100]).
+      - `five_hour.resets_at` / `seven_day.resets_at` advanced when the
+        anchor's window has rolled.
+      - `_extrapolated` diagnostic block added so downstream code can
+        surface freshness metadata.
+    """
+    info = {
+        "anchor_ts": anchor_ts_iso,
+        "anchor_age_sec": None,
+        "session": {"applied": False},
+        "week":    {"applied": False},
+    }
+    anchor_dt = _parse_iso(anchor_ts_iso)
+    if anchor_dt:
+        info["anchor_age_sec"] = int(
+            (datetime.now(timezone.utc) - anchor_dt).total_seconds()
+        )
+
+    def _apply(kind, block_key, window_hours):
+        block = data.get(block_key) or {}
+        if block.get("resets_at") is None or block.get("utilization") is None:
+            return
+        k = _empirical_pct_per_mtok(conn, kind)
+        if not k or k <= 0:
+            return
+        eff_pct, eff_ts, eff_reset = _roll_window_forward(
+            block.get("utilization") or 0,
+            anchor_ts_iso,
+            block.get("resets_at"),
+            window_hours=window_hours,
+        )
+        tokens = _tokens_since(conn, eff_ts)
+        delta_pct = (tokens / 1_000_000) * k
+        new_pct = min(100.0, max(0.0, eff_pct + delta_pct))
+        data[block_key]["utilization"] = new_pct
+        data[block_key]["resets_at"] = eff_reset
+        info[kind] = {
+            "applied": True,
+            "anchor_pct": round(eff_pct, 2),
+            "delta_pct": round(delta_pct, 2),
+            "tokens": tokens,
+            "pct_per_mtok": round(k, 4),
+            "rolled_over": eff_ts != anchor_ts_iso,
+        }
+
+    _apply("session", "five_hour", 5)
+    _apply("week",    "seven_day", 168)
+
+    data["_extrapolated"] = info
+    return data
+
+
 # ---------- widget payload ----------
 
 def widget_payload(data=None, conn=None, target=DEFAULT_TARGET):
@@ -1633,6 +1899,10 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET):
             "rate_pct_per_active_hour": rate_pct_per_hour,
             "status": status,
         },
+        # Forward the extrapolation diagnostic block so the widget can show
+        # "live (api stale 4h)" instead of silently freezing. Absent when the
+        # caller didn't run extrapolation (e.g. CLI --json-raw path).
+        "extrapolated": data.get("_extrapolated"),
     }
 
 
@@ -1667,61 +1937,117 @@ def main():
     conn = dbmod.connect()
 
     if args.widget_json:
-        # Prefer the latest DB snapshot (launchd refreshes every 15 min) so
-        # the widget doesn't hammer the Anthropic API on its 60s render loop.
-        # Only fall back to a live fetch if the newest snapshot is stale or
-        # missing — keeps the widget responsive after a laptop wake, etc.
+        # Strategy: never let the widget paint stale numbers. The
+        # /api/oauth/usage endpoint rate-limits us for hours at a time
+        # (429 with Retry-After: 0), so we can't count on a live fetch
+        # every render. Instead:
         #
-        # Error policy: the widget must NEVER render an error bar. If the
-        # live fetch fails (429 from /api/oauth/usage, network hiccup, token
-        # refresh, etc.), silently fall back to the last-known DB snapshot
-        # even if it's past the freshness window. A slightly stale reading
-        # is always better than a red error splash in the menu bar. Only if
-        # we have literally no DB row to fall back on do we emit a payload
-        # the widget can quietly ignore.
-        data = None
-        stale_after_min = 20
+        #   1. Use the most recent snapshot as a calibration anchor.
+        #   2. Quick incremental backfill so the turns table has every
+        #      assistant turn up to this second.
+        #   3. Extrapolate session% and week% forward from the anchor
+        #      using local token burn × empirical %-per-Mtok.
+        #
+        # That keeps the widget's numbers live-to-the-minute with zero
+        # network dependency. The API snapshot stays the source of truth
+        # — extrapolation is a forward projection from it, and each new
+        # successful launchd snapshot re-anchors us automatically.
+        #
+        # Error policy per CLAUDE.md: the widget must NEVER render a red
+        # error. If we have no anchor AND the one emergency live fetch
+        # fails, we print `{}` so the JSX shows "loading…" and tries
+        # again on its next 60s refresh.
+
         row = dbmod.latest_snapshot(conn)
-        fresh_row_data = None
-        stale_row_data = None
+        data = None
+        anchor_ts = None
         if row and row["raw_json"]:
             try:
-                stale_row_data = json.loads(row["raw_json"])
+                data = json.loads(row["raw_json"])
+                anchor_ts = row["ts"]
             except Exception:
-                stale_row_data = None
-            snap_ts = _parse_iso(row["ts"])
-            if snap_ts and stale_row_data is not None:
-                age_min = (datetime.now(timezone.utc) - snap_ts).total_seconds() / 60
-                if age_min <= stale_after_min:
-                    fresh_row_data = stale_row_data
-        if fresh_row_data is not None:
-            data = fresh_row_data
-        else:
+                data = None
+
+        if data is None:
+            # Cold start — no snapshot in the DB at all. Try one live
+            # fetch to establish an anchor, then persist it so subsequent
+            # widget renders have something to extrapolate from.
             try:
                 data = get_usage()
+                anchor_ts = datetime.now(timezone.utc).isoformat()
+                dbmod.insert_snapshot(
+                    conn, ts=anchor_ts, source="widget", data=data,
+                )
             except Exception:
-                # Live fetch failed — fall back to the most recent snapshot
-                # we have, however old. The widget will keep displaying the
-                # last-known state instead of flashing a 429 / network error.
-                data = stale_row_data
-        if data is None:
-            # No DB snapshot and no live fetch. Emit an empty-but-valid
-            # payload so the widget shows "loading…" instead of an error.
-            print("{}")
-            return 0
+                print("{}")
+                return 0
+
+        # Keep the turns table fresh enough for extrapolation to matter.
+        # Skip the backfill subprocess if the newest turn in the DB is
+        # already within the last 2 minutes — on a busy widget refresh
+        # loop we'd otherwise re-scan the same JSONLs 30x per session.
+        #
+        # Concurrency: the launchd agent ALSO runs backfill every 15 min,
+        # and multiple concurrent backfill processes will deadlock each
+        # other on the write lock. Use a mtime-based lockfile to ensure
+        # at most one backfill is in flight at a time and to rate-limit
+        # restarts to ≥90s apart. The launchd agent observes the same lock.
+        #
+        # Performance: prefer `--since 10m` (the smallest window that still
+        # catches any burst the user just created) over `--since 1h` —
+        # scanning fewer files means a widget render that finishes well
+        # under the 60s refresh cadence on a busy laptop.
+        #
+        # Widget policy: swallow every exception here. A failed backfill
+        # just means the extrapolation slightly undercounts the most
+        # recent seconds of burn; nothing should ever reach the JSX as
+        # an error.
+        try:
+            newest_row = conn.execute(
+                "SELECT MAX(ts) AS m FROM turns"
+            ).fetchone()
+            newest = newest_row["m"] if newest_row else None
+            newest_dt = _parse_iso(newest) if newest else None
+            stale_turns = (
+                newest_dt is None
+                or (datetime.now(timezone.utc) - newest_dt).total_seconds() > 120
+            )
+        except Exception:
+            stale_turns = True
+        if stale_turns and _acquire_backfill_lock(max_age_sec=90):
+            try:
+                # Short synchronous run (the common case finishes in a
+                # few seconds against 10m of JSONL tail). The 20s timeout
+                # keeps a slow backfill from blocking the widget render
+                # — if we hit the timeout the orphaned subprocess is
+                # harmless, since the lockfile throttle prevents pile-up.
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(__file__).parent / "claude_usage_backfill.py"),
+                        "--since", "10m",
+                    ],
+                    capture_output=True, text=True, timeout=20,
+                )
+            except (subprocess.SubprocessError, OSError):
+                pass
+
+        _extrapolate_live(conn, data, anchor_ts)
         print(json.dumps(widget_payload(data=data, conn=conn, target=args.target)))
         return 0
 
     if args.snapshot_only:
         # Silent mode for launchd — no panel, no prints on success.
-        # Two things happen here:
-        #   1. Insert an API-poll snapshot (the historical reason for this mode).
-        #   2. Incremental-backfill any JSONL turns touched in the last 2h.
-        #      Without this, the `turns` table falls behind the live JSONLs
-        #      and everything DB-driven (DAYS card, reports, rate calcs)
-        #      shows stale "0 turns today" until a human runs the backfill.
-        #      2h window with 15-min agent cadence = 8x overlap; idempotent
-        #      via UNIQUE(message_uuid) so overlap is free.
+        # Two independent tasks run here, and each MUST survive the other
+        # failing. In particular the backfill is valuable even when the
+        # API fetch is being rate-limited (429s for hours at a time are
+        # normal), because it keeps the turns table fresh for the widget's
+        # live-extrapolation path.
+        #
+        # Previously, an API failure would `return 1` before the backfill
+        # ran — which meant a 429 storm would silently freeze the turns
+        # table too, and the widget had nothing to project forward from.
+        api_ok = False
         try:
             data = get_usage()
             dbmod.insert_snapshot(
@@ -1730,24 +2056,32 @@ def main():
                 source=args.source,
                 data=data,
             )
+            api_ok = True
         except Exception as e:
-            # Surface to launchd stderr log but don't crash-loop
+            # Surface to launchd stderr log but don't crash-loop and
+            # don't abort — the backfill is independent and still useful.
             print(f"snapshot failed: {e}", file=sys.stderr)
-            return 1
-        # Backfill is a separate subprocess so a failure there can't abort
-        # the snapshot step (which is the more critical of the two).
-        try:
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(Path(__file__).parent / "claude_usage_backfill.py"),
-                    "--since", "2h",
-                ],
-                capture_output=True, text=True, timeout=120,
-            )
-        except (subprocess.SubprocessError, OSError) as e:
-            print(f"backfill failed (non-fatal): {e}", file=sys.stderr)
-        return 0
+        # Respect the backfill lock so we don't stampede the widget's
+        # own backfill subprocess. max_age of 60s is generous: launchd
+        # runs us every 15 min, so we'll almost always acquire — and if
+        # a widget call beat us by <60s, their recent rescan is fresh
+        # enough to skip ours this round.
+        if _acquire_backfill_lock(max_age_sec=60):
+            try:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(__file__).parent / "claude_usage_backfill.py"),
+                        "--since", "2h",
+                    ],
+                    capture_output=True, text=True, timeout=120,
+                )
+            except (subprocess.SubprocessError, OSError) as e:
+                print(f"backfill failed (non-fatal): {e}", file=sys.stderr)
+        # Exit non-zero if the API half failed so launchd's last-exit-status
+        # still reflects real API health (that's what the user sees in
+        # `launchctl list com.infrastructure.cc-usage.snapshot`).
+        return 0 if api_ok else 1
 
     # Panel always renders first (unless --validate-only mode)
     print_panel(
