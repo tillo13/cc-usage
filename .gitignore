@@ -6,6 +6,9 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 
+# Backfill stampede lockfile — mtime-based, regenerated on demand.
+data/.backfill.lock
+
 # ─── python caches ─────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
