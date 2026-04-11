@@ -348,6 +348,23 @@ busy-loop. You can verify by running
 and watching `pgrep -lf bersicht` — a new PID appears almost
 immediately.
 
+**Why do I only ever see one Übersicht menu-bar icon, even though
+both macOS and the watchdog want to launch it?**
+Übersicht silently registers itself as a macOS Background Login Item
+on first launch (visible in `sfltool dumpbtm` under developer "Felix
+Hageloh"). At login, both that Login Item and the
+`com.ubersicht.keepalive` watchdog would otherwise spawn their own
+copy — two processes, two menu-bar icons. The watchdog sidesteps
+this by invoking a small dedupe shim that first checks for an
+existing Übersicht via `pgrep -f "MacOS/Übersicht"` and only spawns
+through `open -g /Applications/Übersicht.app` if missing;
+LaunchServices then collapses any race into a single process by
+bundle ID. The shim polls until Übersicht dies, then exits so
+`KeepAlive=true` reruns it. Net effect: exactly one Übersicht, still
+self-healing on crash / Cmd-Q / reboot. If you ever see two icons,
+the watchdog has been reverted to a direct-exec form — don't do
+that.
+
 **Will it blow up my rate limits?**
 The widget refreshes every 60s but its render path never touches the
 API — it uses the local DB as a calibration anchor and extrapolates

@@ -15,6 +15,7 @@
        · restarts it within seconds if it crashes or is quit (KeepAlive)
        · throttles restart attempts so a broken binary can't busy-loop
        · runs as Interactive so the menu-bar UI gets real priority
+       · DEDUPES against macOS Login Items (see shim rationale below)
 
      No template placeholders — paths are fixed on macOS.
 
@@ -35,7 +36,7 @@
        3. Prove self-healing:
 
             pkill -f /Applications/Übersicht.app/Contents/MacOS/Übersicht
-            sleep 12
+            sleep 20
             pgrep -lf bersicht   # should show a NEW pid
 
      UNINSTALL:
@@ -49,14 +50,56 @@
     <key>Label</key>
     <string>com.ubersicht.keepalive</string>
 
-    <!-- Point at the actual Mach-O binary inside the .app bundle, NOT
-         `open -a Übersicht`. `open` returns immediately, which launchd
-         would interpret as a successful exit and either stop relaunching
-         (SuccessfulExit=false semantics) or busy-loop. Running the binary
-         directly lets launchd observe the real process lifecycle. -->
+    <!-- Dedupe-safe shim, NOT a direct binary exec.
+
+         Rationale: macOS silently registers Übersicht as a Background
+         Login Item the first time it's opened (via SMAppService; visible
+         in `sfltool dumpbtm` as developer "Felix Hageloh"). That Login
+         Item auto-spawns Übersicht at login and survives everything a
+         script can reach — it can only be removed from System Settings →
+         General → Login Items & Extensions. If this agent execs the
+         Mach-O binary directly, we race the Login Item and end up with
+         TWO Übersicht processes, i.e. two menu-bar icons.
+
+         The shim below solves this without fighting the Login Item:
+           1. checks whether Übersicht is already running (catching
+              the Login Item twin or a manual user launch), and
+           2. only spawns it via `open -g` if missing.
+         `open -g` goes through LaunchServices, which deduplicates by
+         bundle ID, so even a race with the Login Item resolves to a
+         single process.
+
+         After ensuring Übersicht is up, the shim polls until Übersicht
+         dies, then exits — launchd's KeepAlive (combined with
+         ThrottleInterval=10) re-runs the shim and we re-attach or
+         re-spawn. Net effect: exactly one Übersicht, self-healing on
+         crash / Cmd-Q / forced kill.
+
+         Why not `exec` the binary directly from the shim? Because we
+         need to be able to ATTACH to an existing process we didn't
+         spawn (the Login Item case). Only polling can do that. -->
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/Übersicht.app/Contents/MacOS/Übersicht</string>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>PATTERN="MacOS/Übersicht"
+APP="/Applications/Übersicht.app"
+if ! pgrep -f "$PATTERN" >/dev/null; then
+    /usr/bin/open -g "$APP"
+    # Wait up to 15s for LaunchServices to actually spawn the binary.
+    tries=0
+    until pgrep -f "$PATTERN" >/dev/null || [ "$tries" -ge 15 ]; do
+        sleep 1
+        tries=$((tries + 1))
+    done
+fi
+# Monitor: block while Übersicht is alive. On death, exit so launchd
+# re-runs us (which re-spawns via the block above).
+while pgrep -f "$PATTERN" >/dev/null; do
+    sleep 5
+done
+exit 0
+</string>
     </array>
 
     <!-- Start it the moment the agent loads (user login, or `launchctl
