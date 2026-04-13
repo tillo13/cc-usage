@@ -39,8 +39,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_usage_db as dbmod  # noqa: E402
 
-PROJECTS_GLOB = os.path.expanduser("~/.claude/projects/*/*.jsonl")
-SESSIONS_GLOB = os.path.expanduser("~/.claude/sessions/*.jsonl")
+# Per-account glob sets.  Each account's JSONL files live under its own
+# CLAUDE_CONFIG_DIR — primary at ~/.claude, overflow at ~/.claude-alt.
+ACCOUNT_GLOBS = {
+    "primary": [
+        os.path.expanduser("~/.claude/projects/*/*.jsonl"),
+        os.path.expanduser("~/.claude/sessions/*.jsonl"),
+    ],
+    "overflow": [
+        os.path.expanduser("~/.claude-alt/projects/*/*.jsonl"),
+        os.path.expanduser("~/.claude-alt/sessions/*.jsonl"),
+    ],
+}
 
 # Trim tool_use input payloads to this size before storing. Keeps DB small
 # while still preserving enough to answer "what did I Grep for most often"
@@ -64,11 +74,16 @@ def _parse_since(arg):
 
 
 def _files_to_scan(since_seconds):
-    files = sorted(glob.glob(PROJECTS_GLOB) + glob.glob(SESSIONS_GLOB))
+    """Return list of (path, account) tuples across all configured accounts."""
+    results = []
+    for account, globs in ACCOUNT_GLOBS.items():
+        for pattern in globs:
+            for f in sorted(glob.glob(pattern)):
+                results.append((f, account))
     if since_seconds is None:
-        return files
+        return results
     cutoff = time.time() - since_seconds
-    return [f for f in files if os.path.getmtime(f) >= cutoff]
+    return [(f, acct) for f, acct in results if os.path.getmtime(f) >= cutoff]
 
 
 def _content_stats(blocks):
@@ -152,7 +167,7 @@ def _int_or_zero(v):
 # per-entry extractors — each returns a list of (table, row) inserts
 # ------------------------------------------------------------------
 
-def _extract_assistant(entry, source_file):
+def _extract_assistant(entry, source_file, account="primary"):
     """Return list of (table, row) pairs for one assistant entry."""
     msg = entry.get("message") or {}
     usage = msg.get("usage") or {}
@@ -188,6 +203,7 @@ def _extract_assistant(entry, source_file):
         "is_sidechain":                1 if entry.get("isSidechain") else 0,
         "cc_version":                  entry.get("version"),
         "source_file":                 source_file,
+        "account":                     account,
         # new granular columns
         "stop_reason":                 msg.get("stop_reason"),
         "stop_details":                json.dumps(msg.get("stop_details")) if msg.get("stop_details") else None,
@@ -323,10 +339,10 @@ def _extract_event(entry, source_file):
     })]
 
 
-def _dispatch(entry, source_file):
+def _dispatch(entry, source_file, account="primary"):
     t = entry.get("type")
     if t == "assistant":
-        return _extract_assistant(entry, source_file)
+        return _extract_assistant(entry, source_file, account=account)
     if t == "user":
         return _extract_user(entry, source_file)
     return _extract_event(entry, source_file)
@@ -364,7 +380,7 @@ def backfill(since=None, verbose=True):
     rows_in_txn = 0
     conn.execute("BEGIN")
 
-    for i, path in enumerate(files, 1):
+    for i, (path, account) in enumerate(files, 1):
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
@@ -376,7 +392,7 @@ def backfill(since=None, verbose=True):
                     except json.JSONDecodeError:
                         continue
                     counts["entries"] += 1
-                    rows = _dispatch(entry, path)
+                    rows = _dispatch(entry, path, account=account)
                     for table, row in rows:
                         counts[table] += 1
                         before = conn.total_changes

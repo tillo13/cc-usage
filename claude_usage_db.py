@@ -188,6 +188,9 @@ _MIGRATIONS = [
     ("turns", "entrypoint",           "TEXT"),
     ("turns", "prompt_id",            "TEXT"),
     ("turns", "user_type",            "TEXT"),
+    # Multi-account support: tag each snapshot/turn with its account.
+    ("snapshots", "account",          "TEXT"),
+    ("turns",     "account",          "TEXT"),
 ]
 
 
@@ -197,6 +200,28 @@ def _apply_migrations(conn):
         cols = {row[1] for row in cur.fetchall()}
         if col not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {typ}")
+    # One-time backfill: tag existing turns rows with account derived from
+    # source_file path.  Rows from ~/.claude-alt/ → "overflow", else "primary".
+    conn.execute("""
+        UPDATE turns SET account = 'overflow'
+        WHERE account IS NULL AND source_file LIKE '%/.claude-alt/%'
+    """)
+    conn.execute("""
+        UPDATE turns SET account = 'primary'
+        WHERE account IS NULL AND source_file IS NOT NULL
+              AND source_file NOT LIKE '%/.claude-alt/%'
+    """)
+    # Tag pre-migration snapshots as primary (they all came from the primary
+    # account — the overflow account didn't exist before this migration).
+    conn.execute("""
+        UPDATE snapshots SET account = 'primary'
+        WHERE account IS NULL
+    """)
+    # Index for account-filtered snapshot queries.
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_snapshots_account_ts
+        ON snapshots(account, ts)
+    """)
     conn.commit()
 
 
@@ -227,7 +252,7 @@ def connect():
 # snapshot insert (unchanged)
 # ------------------------------------------------------------------
 
-def insert_snapshot(conn, *, ts, source, data):
+def insert_snapshot(conn, *, ts, source, data, account="primary"):
     """Insert a /api/oauth/usage response. `data` is the raw dict from the API."""
     import json as _json
 
@@ -239,17 +264,17 @@ def insert_snapshot(conn, *, ts, source, data):
     conn.execute(
         """
         INSERT INTO snapshots (
-            ts, source,
+            ts, source, account,
             five_hour_pct, five_hour_reset,
             seven_day_pct, seven_day_reset,
             seven_day_sonnet_pct, seven_day_sonnet_reset,
             seven_day_opus_pct, seven_day_opus_reset,
             extra_used_cents, extra_limit_cents, extra_reset,
             raw_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
-            ts, source,
+            ts, source, account,
             g("five_hour", "utilization"),        g("five_hour", "resets_at"),
             g("seven_day", "utilization"),        g("seven_day", "resets_at"),
             g("seven_day_sonnet", "utilization"), g("seven_day_sonnet", "resets_at"),
@@ -330,17 +355,28 @@ def query_turns_since(conn, since_iso_utc, until_iso_utc=None):
     ).fetchall()
 
 
-def query_snapshots_since(conn, since_iso_utc):
+def query_snapshots_since(conn, since_iso_utc, account=None):
+    if account:
+        return conn.execute(
+            "SELECT * FROM snapshots WHERE ts >= ? AND COALESCE(account, 'primary') = ? ORDER BY ts",
+            (since_iso_utc, account),
+        ).fetchall()
     return conn.execute(
         "SELECT * FROM snapshots WHERE ts >= ? ORDER BY ts",
         (since_iso_utc,),
     ).fetchall()
 
 
-def latest_snapshot(conn):
-    row = conn.execute(
-        "SELECT * FROM snapshots ORDER BY ts DESC LIMIT 1"
-    ).fetchone()
+def latest_snapshot(conn, account=None):
+    if account:
+        row = conn.execute(
+            "SELECT * FROM snapshots WHERE COALESCE(account, 'primary') = ? ORDER BY ts DESC LIMIT 1",
+            (account,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM snapshots ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
     return row
 
 

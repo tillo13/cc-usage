@@ -60,8 +60,8 @@
 // REPO_ROOT is the absolute path to this cloned cc_usage repo. The
 // widget invokes `${REPO_ROOT}/claude_code_usage.py --widget-json`.
 //
-const PYTHON_BIN = "/usr/local/bin/python3"
-const REPO_ROOT  = "/Users/YOU/path/to/cc_usage"
+const PYTHON_BIN = "/Users/at/Desktop/code/kicksaw/venv_kicksaw/bin/python3"
+const REPO_ROOT  = "/Users/at/Desktop/code/_infrastructure/cc_usage"
 
 export const command =
   "PATH=/usr/bin:/bin:/usr/sbin:/sbin " +
@@ -471,13 +471,14 @@ export const render = ({ output, error }) => {
       </div>
     )
   }
+  // Multi-account support: new Python emits {accounts: {primary: {...}, overflow: {...}}}.
+  // Backward compat: if d.session exists (old single-account format), treat d as primary.
+  const primary = (d.accounts && d.accounts.primary) ? d.accounts.primary : (d.session ? d : null)
+  const overflow = (d.accounts && d.accounts.overflow) ? d.accounts.overflow : null
+
   // Empty-payload sentinel: Python emits `{}` when it has neither a fresh
-  // live fetch nor any DB snapshot to fall back on. Show the loading state
-  // instead of rendering an all-zero bar (or, worse, an error splash).
-  // Note: the old `d.error` branch was removed — Python never emits that
-  // key anymore; the widget_json path silently falls back to stale DB data
-  // on any live-fetch failure (429, network, token refresh, etc.).
-  if (!d || !d.session) {
+  // live fetch nor any DB snapshot to fall back on.
+  if (!primary || !primary.session) {
     return (
       <div className="bar">
         <div className="row"><span className="lbl">CLAUDE CODE</span><span className="val hint">loading…</span></div>
@@ -485,12 +486,23 @@ export const render = ({ output, error }) => {
     )
   }
 
-  const session = d.session || {}
-  const weekly = d.weekly || {}
-  const constraint = d.constraint || {}
-  const today = d.today || {}
-  const extra = d.extra
-  const target = d.target_pct || 99
+  // ── role swap: whichever account is ACTIVE gets the full Row 1+2 ──
+  // When primary is capped (≥95%), the overflow becomes the daily driver
+  // and gets promoted to the full instrument display. The capped primary
+  // gets demoted to a compact "resets fri 6am → switch back" strip.
+  const primaryCapped = (primary.weekly || {}).used_pct >= 95
+  const hasOverflow = overflow && overflow.session
+  const active = (primaryCapped && hasOverflow) ? overflow : primary
+  const standby = (primaryCapped && hasOverflow) ? primary : overflow
+  const activeLabel = active.account_label || "Max 20x"
+  const standbyIsPrimary = primaryCapped && hasOverflow
+
+  const session = active.session || {}
+  const weekly = active.weekly || {}
+  const constraint = active.constraint || {}
+  const today = active.today || {}
+  const extra = active.extra
+  const target = active.target_pct || 99
 
   // ── session math ──
   const sessTotal = 5.0
@@ -533,7 +545,7 @@ export const render = ({ output, error }) => {
   // Read directly from ~/.claude/projects/*.jsonl, sorted worst-first.
   // The Python side classifies each session into a band and attaches
   // `band` + `status_word` so the JSX just displays them.
-  const liveSessions = Array.isArray(d.live_sessions) ? d.live_sessions : []
+  const liveSessions = Array.isArray(active.live_sessions) ? active.live_sessions : []
   const liveCount = liveSessions.length
   const liveTop = liveSessions.slice(0, 3)        // inline display
   const worst = liveSessions[0] || null            // drives the headline pill
@@ -549,7 +561,7 @@ export const render = ({ output, error }) => {
 
         {/* IDENTITY */}
         <div className="card">
-          <span className="lbl lblDim">claude code</span>
+          <span className="lbl lblDim">claude code{standbyIsPrimary ? " · pro" : ""}</span>
           <span className="val">
             <span className="num">{target}</span>
             <span className="unit">%</span>
@@ -678,7 +690,7 @@ export const render = ({ output, error }) => {
 
         <span className="updated">
           <span className="pulse" />
-          <span>{d.updated_pt || "—"}</span>
+          <span>{d.updated_pt || primary.updated_pt || "—"}</span>
         </span>
       </div>
 
@@ -971,6 +983,232 @@ export const render = ({ output, error }) => {
         ]}
 
       </div>
+
+      {/* ════════════════════════════════════════════════════════════
+           ROW 3 — STANDBY ACCOUNT (compact strip)
+           Role-aware: shows whichever account is NOT driving Rows 1+2.
+           Normal mode: standby = overflow, shows switch ETA.
+           Capped mode: standby = primary, shows "resets fri 6am → switch back".
+         ════════════════════════════════════════════════════════════ */}
+      {standby && standby.session && (() => {
+        const stbSess = standby.session || {}
+        const stbWeek = standby.weekly || {}
+        const stbSessQ = clamp(stbSess.used_pct || 0)
+        const stbWeekQ = clamp(stbWeek.used_pct || 0)
+        const stbSessLeft = stbSess.hours_left != null ? stbSess.hours_left : 0
+        const stbSessEl = Math.max(0, 5 - stbSessLeft)
+        const stbSessTime = clamp((stbSessEl / 5) * 100)
+        const stbSessDelta = stbSessQ - stbSessTime
+        const stbWeekLeft = stbWeek.hours_left != null ? stbWeek.hours_left : 0
+        const stbWeekEl = Math.max(0, 168 - stbWeekLeft)
+        const stbWeekTime = clamp((stbWeekEl / 168) * 100)
+        const stbWeekDelta = stbWeekQ - stbWeekTime
+        const stbLabel = standby.account_label || "Standby"
+        const stbReset = stbWeek.reset_time_local || stbWeek.reset_label || "—"
+        const stbDays = stbWeek.days_left
+
+        if (standbyIsPrimary) {
+          // ── CAPPED MODE: primary is in standby, waiting for reset ──
+          const resetHours = stbWeekLeft
+          const resetClass = resetHours < 4 ? "good" : resetHours < 24 ? "hint" : "hint"
+          const switchBackSoon = resetHours < 2
+          // Check if the ACTIVE account (overflow) is also running low.
+          // weekQuotaPct comes from the active account (set above in Rows 1+2).
+          const overflowHot = weekQuotaPct >= 80
+          const overflowCapped = weekQuotaPct >= 95
+          const onFumes = overflowHot || overflowCapped
+
+          if (onFumes) {
+            // ── FUMES MODE: both accounts running low ──
+            return (
+              <div className="row row2">
+                <div className="card cardInline">
+                  <span className="lbl warn">
+                    {overflowCapped ? "both capped" : "running low"}
+                  </span>
+                  <span className="val">
+                    <span className={overflowCapped ? "crit" : "warn"}>
+                      {overflowCapped ? "▶ UPGRADE OVERFLOW" : "overflow at " + weekQuotaPct.toFixed(0) + "%"}
+                    </span>
+                    <span className="dot">·</span>
+                    <span className="unit">primary resets</span>
+                    <span className="hint">{stbReset}</span>
+                    {stbDays != null && [
+                      <span key="fd" className="hint"> ({stbDays.toFixed(1)}d)</span>,
+                    ]}
+                  </span>
+
+                  <div className="tip">
+                    <span className="tipHead">
+                      {overflowCapped
+                        ? "both accounts capped — action required"
+                        : "overflow running low — plan ahead"}
+                    </span>
+                    <span className="tipKey">overflow  </span>
+                    <span className={"tipVal " + (overflowCapped ? "crit" : "warn")}>
+                      {weekQuotaPct.toFixed(0)}% weekly
+                    </span>{"\n"}
+                    <span className="tipKey">primary   </span>
+                    <span className="tipVal crit">{stbWeekQ.toFixed(0)}% weekly (capped)</span>{"\n"}
+                    <span className="tipKey">resets at </span>
+                    <span className="tipVal">{stbReset} ({stbDays != null ? stbDays.toFixed(1) + "d" : "?"})</span>{"\n"}
+                    {"\n"}
+                    <span className="tipVal warn">OPTIONS — pick one:</span>{"\n"}
+                    {"\n"}
+                    <span className="tipVal">1. Upgrade tilloat@gmail.com</span>{"\n"}
+                    <span className="tipKey">   log in at claude.ai as tilloat@gmail.com</span>{"\n"}
+                    <span className="tipKey">   → Settings → Subscription → upgrade to:</span>{"\n"}
+                    <span className="tipKey">     • </span><span className="tipVal">Max 5x  ($100/mo)</span><span className="tipKey"> — good for heavy weeks</span>{"\n"}
+                    <span className="tipKey">     • </span><span className="tipVal">Max 20x ($200/mo)</span><span className="tipKey"> — full mirror of primary</span>{"\n"}
+                    {"\n"}
+                    <span className="tipVal">2. Re-enable extra usage on primary</span>{"\n"}
+                    <span className="tipKey">   log in at claude.ai as your main account</span>{"\n"}
+                    <span className="tipKey">   → Settings → Usage → toggle extra usage ON</span>{"\n"}
+                    <span className="tipKey">   ⚠ charges at API rates ($1=$1, ~50x worse)</span>{"\n"}
+                    {"\n"}
+                    <span className="tipVal">3. Wait for primary reset</span>{"\n"}
+                    <span className="tipKey">   primary resets {stbReset}</span>{"\n"}
+                    <span className="tipKey">   use claude (not claude2) after reset</span>{"\n"}
+                    <span className="tipNote">
+                      The Pro plan ($20/mo) is meant as a cheap relief valve
+                      for 1-2 overflow days. If you're consistently burning
+                      through it, upgrading to Max 5x ($100) is 50x better
+                      value than re-enabling extra usage on primary.
+                    </span>
+                  </div>
+                </div>
+              </div>
+            )
+          }
+
+          // ── NORMAL CAPPED MODE: overflow still has headroom ──
+          return (
+            <div className="row row2">
+              <div className="card cardInline">
+                <span className="lbl">{stbLabel.toLowerCase()} <span className="lblDim">· capped</span></span>
+                <span className="val">
+                  {switchBackSoon ? [
+                    <span key="sb" className="good">▶ SWITCH BACK</span>,
+                    <span key="sc" className="hint">claude</span>,
+                    <span key="sd" className="dot">·</span>,
+                  ] : [
+                    <span key="rb" className="unit">resets</span>,
+                    <span key="rt" className={resetClass}>{stbReset}</span>,
+                    stbDays != null && <span key="rd" className="hint">({stbDays.toFixed(1)}d)</span>,
+                    <span key="rs" className="dot">→</span>,
+                    <span key="rl" className="hint">switch back to claude</span>,
+                    <span key="re" className="dot">·</span>,
+                  ]}
+                  <span className="unit">wk</span>
+                  <span className="crit">{stbWeekQ.toFixed(0)}%</span>
+                  <span className="pbar" style={{ width: "48px" }}>
+                    <span className="fillTime" style={{ width: stbWeekTime + "%" }} />
+                    <span className="fillQuota bgCrit" style={{ width: stbWeekQ + "%" }} />
+                  </span>
+                </span>
+
+                <div className="tip">
+                  <span className="tipHead">{stbLabel} · capped, waiting for reset</span>
+                  <span className="tipKey">status    </span><span className="tipVal crit">weekly cap reached ({stbWeekQ.toFixed(0)}%)</span>{"\n"}
+                  <span className="tipKey">resets at </span><span className="tipVal">{stbReset}</span>{"\n"}
+                  <span className="tipKey">days left </span><span className="tipVal">{stbDays != null ? stbDays.toFixed(1) : "—"}</span>{"\n"}
+                  {"\n"}
+                  <span className="tipKey">when it resets:</span>{"\n"}
+                  <span className="tipKey">  1. open a new terminal tab</span>{"\n"}
+                  <span className="tipKey">  2. type </span><span className="tipVal">claude</span><span className="tipKey"> (not claude2)</span>{"\n"}
+                  <span className="tipKey">  3. primary Max 20x allotment is back</span>{"\n"}
+                  <span className="tipNote">
+                    The primary account resets to 0% weekly usage at
+                    the time shown above. Once it resets, switch back
+                    to save the Pro overflow for next week's cap.
+                  </span>
+                </div>
+              </div>
+            </div>
+          )
+        }
+
+        // ── NORMAL MODE: overflow is in standby ──
+        const capEta = standby.primary_cap_eta
+        const capLabel = capEta ? capEta.label : null
+        const capHours = capEta ? capEta.hours : null
+        const willCap = capEta ? capEta.will_cap : false
+        // Urgency: <12h = imminent (amber), <4h = critical (white underline)
+        const capClass = capHours == null ? "hint"
+          : capHours < 4 ? "crit"
+          : capHours < 12 ? "warn"
+          : "good"
+        return (
+          <div className="row row2">
+            <div className="card cardInline">
+              <span className="lbl">{stbLabel.toLowerCase()} <span className="lblDim">· overflow</span></span>
+              <span className="val">
+                {willCap && capLabel ? [
+                  <span key="sw" className="unit">switch</span>,
+                  <span key="sl" className={capClass}>~{capLabel}</span>,
+                  capHours != null && <span key="sh" className="hint">({capHours < 24 ? capHours.toFixed(0) + "h" : (capHours / 24).toFixed(1) + "d"})</span>,
+                  <span key="sd" className="dot">·</span>,
+                ] : [
+                  <span key="ns" className="hint">no switch needed</span>,
+                  <span key="nd" className="dot">·</span>,
+                ]}
+                <span className="unit">sess</span>
+                <span className={paceClass(stbSessDelta)}>{stbSessQ.toFixed(0)}%</span>
+                <span className="pbar" style={{ width: "48px" }}>
+                  <span className="fillTime" style={{ width: stbSessTime + "%" }} />
+                  <span className={"fillQuota " + paceBgClass(stbSessDelta)} style={{ width: stbSessQ + "%" }} />
+                </span>
+                <span className="dot">·</span>
+                <span className="unit">wk</span>
+                <span className={paceClass(stbWeekDelta)}>{stbWeekQ.toFixed(0)}%</span>
+                <span className="pbar" style={{ width: "48px" }}>
+                  <span className="fillTime" style={{ width: stbWeekTime + "%" }} />
+                  <span className={"fillQuota " + paceBgClass(stbWeekDelta)} style={{ width: stbWeekQ + "%" }} />
+                </span>
+                {stbDays != null && [
+                  <span key="od" className="dot">·</span>,
+                  <span key="on" className="num">{stbDays.toFixed(1)}</span>,
+                  <span key="ou" className="unit">d left</span>,
+                ]}
+                <span className="dot">·</span>
+                <span className="hint">{stbReset}</span>
+              </span>
+
+              <div className="tip">
+                <span className="tipHead">{stbLabel} · overflow account</span>
+                {willCap && capLabel ? [
+                  <span key="e1" className="tipKey">switch at </span>,
+                  <span key="e2" className={"tipVal " + capClass}>~{capLabel}</span>,
+                  <span key="e3" className="tipKey">  ({capHours != null ? (capHours < 24 ? capHours.toFixed(1) + "h" : (capHours / 24).toFixed(1) + "d") : "?"} from now)</span>,
+                  "\n",
+                  <span key="e4" className="tipKey">primary   </span>,
+                  <span key="e5" className="tipVal">burning {capEta.rate_pct_per_hour.toFixed(2)}%/hr → hits 100% before reset</span>,
+                  "\n",
+                  <span key="e6" className="tipKey">command   </span>,
+                  <span key="e7" className="tipVal">claude2</span>,
+                  <span key="e8" className="tipKey">  (new terminal tab when the time comes)</span>,
+                  "\n",
+                ] : [
+                  <span key="e1" className="tipKey">switch at </span>,
+                  <span key="e2" className="tipVal good">not projected — primary won't cap this week</span>,
+                  "\n",
+                ]}
+                <span className="tipKey">session   </span><span className={"tipVal " + paceClass(stbSessDelta)}>{stbSessQ.toFixed(0)}% used</span>{"\n"}
+                <span className="tipKey">weekly    </span><span className={"tipVal " + paceClass(stbWeekDelta)}>{stbWeekQ.toFixed(0)}% used</span>{"\n"}
+                <span className="tipKey">days left </span><span className="tipVal">{stbDays != null ? stbDays.toFixed(1) : "—"}</span>{"\n"}
+                <span className="tipKey">resets at </span><span className="tipVal">{stbReset}</span>
+                <span className="tipNote">
+                  Switch to claude2 when the primary account hits its weekly
+                  cap. This account absorbs the overflow at subscription
+                  rates (~50x better value than extra usage overage).
+                  {"\n\n"}alias: claude2='CLAUDE_CONFIG_DIR=~/.claude-alt claude'
+                </span>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
     </div>
   )
 }

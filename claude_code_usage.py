@@ -64,6 +64,15 @@ USER_AGENT = "claude-cli/2.1.101 (external, cli)"
 # Extracted from the Claude Code CLI binary (constant `GP`).
 ANTHROPIC_BETA = "oauth-2025-04-20"
 KEYCHAIN_SERVICE = "Claude Code-credentials"
+
+# Multi-account registry.  Each key maps to the keychain service name and a
+# human-readable label.  The overflow account absorbs usage after the primary
+# hits its weekly cap — see MULTI_ACCOUNT_PLAN.md for the full rationale.
+ACCOUNTS = {
+    "primary":  {"keychain": "Claude Code-credentials",          "label": "Max 20x", "tier": "max_20x"},
+    "overflow": {"keychain": "Claude Code-credentials-bae1e975", "label": "Pro",     "tier": "pro"},
+}
+
 # Local wall-clock timezone for human-friendly displays ("4:28pm", "Sat Apr 11").
 # Override with the CC_USAGE_TZ env var (any IANA zone name, e.g. "Europe/Berlin").
 # Defaults to America/Los_Angeles to match the Anthropic quota reset convention.
@@ -73,11 +82,11 @@ DEFAULT_TARGET = 99.0
 
 # ---------- auth + fetch ----------
 
-def _load_access_token():
+def _load_access_token(keychain_service=KEYCHAIN_SERVICE):
     result = subprocess.run(
         [
             "security", "find-generic-password",
-            "-s", KEYCHAIN_SERVICE,
+            "-s", keychain_service,
             "-a", getpass.getuser(),
             "-w",
         ],
@@ -85,17 +94,17 @@ def _load_access_token():
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"Claude Code keychain entry not found: "
+            f"Claude Code keychain entry not found ({keychain_service}): "
             f"{result.stderr.strip() or 'unknown error'}"
         )
     return json.loads(result.stdout)["claudeAiOauth"]["accessToken"]
 
 
-def get_usage():
+def get_usage(keychain_service=KEYCHAIN_SERVICE):
     resp = requests.get(
         USAGE_URL,
         headers={
-            "Authorization": f"Bearer {_load_access_token()}",
+            "Authorization": f"Bearer {_load_access_token(keychain_service)}",
             "anthropic-beta": ANTHROPIC_BETA,
             "User-Agent": USER_AGENT,
         },
@@ -318,7 +327,7 @@ def _status(recent, safe):
 
 # ---------- active-hour rate (the "real work" unit) ----------
 
-def _active_hour_stats(conn, since_iso, project_filter=None):
+def _active_hour_stats(conn, since_iso, project_filter=None, account=None):
     """
     An 'active hour' = a distinct calendar hour (UTC bucket — consistent,
     not drifting with DST) where at least one non-sidechain assistant turn
@@ -331,6 +340,9 @@ def _active_hour_stats(conn, since_iso, project_filter=None):
     if project_filter:
         where += " AND project_cwd LIKE ?"
         params.append(f"%{project_filter}%")
+    if account:
+        where += " AND COALESCE(account, 'primary') = ?"
+        params.append(account)
     row = conn.execute(
         f"""
         SELECT
@@ -1423,10 +1435,11 @@ def _bucket_reset(iso_ts):
     return iso_ts[:13]
 
 
-def _empirical_pct_per_mtok(conn, kind):
+def _empirical_pct_per_mtok(conn, kind, account="primary"):
     """Empirical %-per-Mtok conversion for the current window.
 
     kind: "session" (five_hour) or "week" (seven_day).
+    account: which account's snapshots+turns to use.
 
     Returns `(last_pct - first_pct) / Σ Mtok(first_ts..last_ts)` across the
     most recent snapshot window. Full-span aggregate is deliberate: any
@@ -1447,7 +1460,9 @@ def _empirical_pct_per_mtok(conn, kind):
     rows = conn.execute(
         f"SELECT ts, {pct_col} AS pct, {reset_col} AS reset "
         f"FROM snapshots WHERE {pct_col} IS NOT NULL "
-        f"ORDER BY ts DESC LIMIT 2000"
+        f"AND COALESCE(account, 'primary') = ? "
+        f"ORDER BY ts DESC LIMIT 2000",
+        (account,),
     ).fetchall()
     if len(rows) < 2:
         return None
@@ -1474,8 +1489,8 @@ def _empirical_pct_per_mtok(conn, kind):
             continue  # window reset or flat — no usable signal this pass
         tok_row = conn.execute(
             "SELECT SUM(input_tokens + output_tokens + cache_creation_input_tokens) AS t "
-            "FROM turns WHERE ts > ? AND ts <= ?",
-            (first["ts"], last["ts"]),
+            "FROM turns WHERE ts > ? AND ts <= ? AND COALESCE(account, 'primary') = ?",
+            (first["ts"], last["ts"], account),
         ).fetchone()
         tokens = tok_row["t"] or 0
         if tokens <= 0:
@@ -1485,12 +1500,12 @@ def _empirical_pct_per_mtok(conn, kind):
     return None
 
 
-def _tokens_since(conn, since_iso):
+def _tokens_since(conn, since_iso, account="primary"):
     """Quota-counted tokens (input + output + cache_creation) since ts."""
     row = conn.execute(
         "SELECT SUM(input_tokens + output_tokens + cache_creation_input_tokens) AS t "
-        "FROM turns WHERE ts > ?",
-        (since_iso,),
+        "FROM turns WHERE ts > ? AND COALESCE(account, 'primary') = ?",
+        (since_iso, account),
     ).fetchone()
     return row["t"] or 0
 
@@ -1516,7 +1531,7 @@ def _roll_window_forward(anchor_pct, anchor_ts_iso, reset_iso, window_hours):
     return 0.0, new_window_start_dt.isoformat(), reset_dt.isoformat()
 
 
-def _extrapolate_live(conn, data, anchor_ts_iso):
+def _extrapolate_live(conn, data, anchor_ts_iso, account="primary"):
     """Advance a raw /api/oauth/usage dict to reflect live token burn.
 
     `data` is the last snapshot's raw payload — possibly seconds old,
@@ -1549,7 +1564,7 @@ def _extrapolate_live(conn, data, anchor_ts_iso):
         block = data.get(block_key) or {}
         if block.get("resets_at") is None or block.get("utilization") is None:
             return
-        k = _empirical_pct_per_mtok(conn, kind)
+        k = _empirical_pct_per_mtok(conn, kind, account=account)
         if not k or k <= 0:
             return
         eff_pct, eff_ts, eff_reset = _roll_window_forward(
@@ -1558,7 +1573,7 @@ def _extrapolate_live(conn, data, anchor_ts_iso):
             block.get("resets_at"),
             window_hours=window_hours,
         )
-        tokens = _tokens_since(conn, eff_ts)
+        tokens = _tokens_since(conn, eff_ts, account=account)
         delta_pct = (tokens / 1_000_000) * k
         new_pct = min(100.0, max(0.0, eff_pct + delta_pct))
         data[block_key]["utilization"] = new_pct
@@ -1581,7 +1596,7 @@ def _extrapolate_live(conn, data, anchor_ts_iso):
 
 # ---------- widget payload ----------
 
-def widget_payload(data=None, conn=None, target=DEFAULT_TARGET):
+def widget_payload(data=None, conn=None, target=DEFAULT_TARGET, account="primary"):
     """
     Return a compact dict of the stats the desktop widget renders.
     No side effects (no snapshot insert): this is called from launchd +
@@ -1591,6 +1606,10 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET):
         data = get_usage()
     if conn is None:
         conn = dbmod.connect()
+    # SQL fragment for filtering turns/snapshots by account. Used by every
+    # query below so we don't pollute one account's stats with another's.
+    _acct_where = "AND COALESCE(account, 'primary') = ?"
+    _acct_bind = (account,)
 
     def _bucket(block, want_active=False):
         if not block:
@@ -1608,7 +1627,7 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET):
         if want_active and reset_iso:
             sess_start = _session_start_iso(reset_iso)
             if sess_start:
-                s = _active_hour_stats(conn, sess_start)
+                s = _active_hour_stats(conn, sess_start, account=account)
                 if s["active_hours"] >= 1 and used > 0:
                     rate = used / s["active_hours"]
                     out["active_hours"] = s["active_hours"]
@@ -1651,7 +1670,7 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET):
             )
             week_start = _week_start_iso(weekly["reset_iso"])
             if week_start:
-                ws = _active_hour_stats(conn, week_start)
+                ws = _active_hour_stats(conn, week_start, account=account)
                 if ws["active_hours"] >= 1:
                     weekly["active_hours"] = ws["active_hours"]
         # Days left until weekly reset (for forecast math)
@@ -1666,12 +1685,12 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET):
         week_start = _week_start_iso(weekly["reset_iso"])
         if week_start:
             rows = conn.execute(
-                """
+                f"""
                 SELECT ts, input_tokens, output_tokens, cache_creation_input_tokens
                 FROM turns
-                WHERE ts >= ? AND is_sidechain = 0
+                WHERE ts >= ? AND is_sidechain = 0 {_acct_where}
                 """,
-                (week_start,),
+                (week_start,) + _acct_bind,
             ).fetchall()
             by_date = {}
             for r in rows:
@@ -1723,34 +1742,34 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET):
     pt_midnight = pt_now.replace(hour=0, minute=0, second=0, microsecond=0)
     pt_midnight_utc_iso = pt_midnight.astimezone(timezone.utc).isoformat()
     today_row = conn.execute(
-        """
+        f"""
         SELECT
             COUNT(DISTINCT strftime('%Y-%m-%d %H', ts)) AS active_hours,
             COUNT(*) AS turns,
             COUNT(DISTINCT session_id) AS sessions,
             SUM(input_tokens + output_tokens + cache_creation_input_tokens) AS tokens
         FROM turns
-        WHERE ts >= ? AND is_sidechain = 0
+        WHERE ts >= ? AND is_sidechain = 0 {_acct_where}
         """,
-        (pt_midnight_utc_iso,),
+        (pt_midnight_utc_iso,) + _acct_bind,
     ).fetchone()
     top_model_row = conn.execute(
-        """
+        f"""
         SELECT model, SUM(input_tokens + output_tokens + cache_creation_input_tokens) AS tok
         FROM turns
-        WHERE ts >= ? AND is_sidechain = 0 AND model IS NOT NULL
+        WHERE ts >= ? AND is_sidechain = 0 AND model IS NOT NULL {_acct_where}
         GROUP BY model ORDER BY tok DESC LIMIT 1
         """,
-        (pt_midnight_utc_iso,),
+        (pt_midnight_utc_iso,) + _acct_bind,
     ).fetchone()
     top_project_row = conn.execute(
-        """
+        f"""
         SELECT project_cwd, SUM(input_tokens + output_tokens + cache_creation_input_tokens) AS tok
         FROM turns
-        WHERE ts >= ? AND is_sidechain = 0 AND project_cwd IS NOT NULL
+        WHERE ts >= ? AND is_sidechain = 0 AND project_cwd IS NOT NULL {_acct_where}
         GROUP BY project_cwd ORDER BY tok DESC LIMIT 1
         """,
-        (pt_midnight_utc_iso,),
+        (pt_midnight_utc_iso,) + _acct_bind,
     ).fetchone()
 
     def _short_model(m):
@@ -1796,7 +1815,7 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET):
             # compute tomorrow hours against THIS bucket's pacing
             week_start = _week_start_iso(b["reset_iso"])
             if week_start:
-                stats = _active_hour_stats(conn, week_start)
+                stats = _active_hour_stats(conn, week_start, account=account)
                 if stats["active_hours"] >= 2:
                     plan = _pull_back_plan(
                         current_pct=b["used_pct"],
@@ -1880,10 +1899,14 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET):
             "will_exhaust_before_reset": will_exhaust_before_reset,
         }
 
+    acct_cfg = ACCOUNTS.get(account, {})
     return {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "updated_pt": datetime.now(timezone.utc).astimezone(PT).strftime("%-I:%M%p").lower(),
         "target_pct": target,
+        "account_id": account,
+        "account_label": acct_cfg.get("label", account),
+        "account_tier": acct_cfg.get("tier", "unknown"),
         "session": session,
         "weekly": weekly,
         "weekly_sonnet": weekly_sonnet,
@@ -1953,55 +1976,16 @@ def main():
         # — extrapolation is a forward projection from it, and each new
         # successful launchd snapshot re-anchors us automatically.
         #
+        # Multi-account: loop over ACCOUNTS, build a per-account payload,
+        # wrap in {"accounts": {...}, "updated_at": ..., "updated_pt": ...}.
+        #
         # Error policy per CLAUDE.md: the widget must NEVER render a red
         # error. If we have no anchor AND the one emergency live fetch
-        # fails, we print `{}` so the JSX shows "loading…" and tries
-        # again on its next 60s refresh.
-
-        row = dbmod.latest_snapshot(conn)
-        data = None
-        anchor_ts = None
-        if row and row["raw_json"]:
-            try:
-                data = json.loads(row["raw_json"])
-                anchor_ts = row["ts"]
-            except Exception:
-                data = None
-
-        if data is None:
-            # Cold start — no snapshot in the DB at all. Try one live
-            # fetch to establish an anchor, then persist it so subsequent
-            # widget renders have something to extrapolate from.
-            try:
-                data = get_usage()
-                anchor_ts = datetime.now(timezone.utc).isoformat()
-                dbmod.insert_snapshot(
-                    conn, ts=anchor_ts, source="widget", data=data,
-                )
-            except Exception:
-                print("{}")
-                return 0
+        # fails for ALL accounts, print `{}` so the JSX shows "loading…"
+        # and tries again on its next 60s refresh.
 
         # Keep the turns table fresh enough for extrapolation to matter.
-        # Skip the backfill subprocess if the newest turn in the DB is
-        # already within the last 2 minutes — on a busy widget refresh
-        # loop we'd otherwise re-scan the same JSONLs 30x per session.
-        #
-        # Concurrency: the launchd agent ALSO runs backfill every 15 min,
-        # and multiple concurrent backfill processes will deadlock each
-        # other on the write lock. Use a mtime-based lockfile to ensure
-        # at most one backfill is in flight at a time and to rate-limit
-        # restarts to ≥90s apart. The launchd agent observes the same lock.
-        #
-        # Performance: prefer `--since 10m` (the smallest window that still
-        # catches any burst the user just created) over `--since 1h` —
-        # scanning fewer files means a widget render that finishes well
-        # under the 60s refresh cadence on a busy laptop.
-        #
-        # Widget policy: swallow every exception here. A failed backfill
-        # just means the extrapolation slightly undercounts the most
-        # recent seconds of burn; nothing should ever reach the JSX as
-        # an error.
+        # (One backfill pass covers both accounts — both glob sets.)
         try:
             newest_row = conn.execute(
                 "SELECT MAX(ts) AS m FROM turns"
@@ -2016,11 +2000,6 @@ def main():
             stale_turns = True
         if stale_turns and _acquire_backfill_lock(max_age_sec=90):
             try:
-                # Short synchronous run (the common case finishes in a
-                # few seconds against 10m of JSONL tail). The 20s timeout
-                # keeps a slow backfill from blocking the widget render
-                # — if we hit the timeout the orphaned subprocess is
-                # harmless, since the lockfile throttle prevents pile-up.
                 subprocess.run(
                     [
                         sys.executable,
@@ -2032,8 +2011,77 @@ def main():
             except (subprocess.SubprocessError, OSError):
                 pass
 
-        _extrapolate_live(conn, data, anchor_ts)
-        print(json.dumps(widget_payload(data=data, conn=conn, target=args.target)))
+        accounts_payload = {}
+        for acct_id, acct_cfg in ACCOUNTS.items():
+            row = dbmod.latest_snapshot(conn, account=acct_id)
+            data = None
+            anchor_ts = None
+            if row and row["raw_json"]:
+                try:
+                    data = json.loads(row["raw_json"])
+                    anchor_ts = row["ts"]
+                except Exception:
+                    data = None
+
+            if data is None:
+                # Cold start for this account — try one live fetch.
+                try:
+                    data = get_usage(keychain_service=acct_cfg["keychain"])
+                    anchor_ts = datetime.now(timezone.utc).isoformat()
+                    dbmod.insert_snapshot(
+                        conn, ts=anchor_ts, source="widget", data=data,
+                        account=acct_id,
+                    )
+                except Exception:
+                    continue  # skip this account, try the next
+
+            _extrapolate_live(conn, data, anchor_ts, account=acct_id)
+            accounts_payload[acct_id] = widget_payload(
+                data=data, conn=conn, target=args.target, account=acct_id,
+            )
+
+        if not accounts_payload:
+            print("{}")
+            return 0
+
+        # Compute primary→cap ETA: when will the primary account hit 100%
+        # weekly? Attach to the overflow payload so the widget can show
+        # "switch ~Tue 2pm" on the overflow row.
+        pri = accounts_payload.get("primary", {})
+        ovf = accounts_payload.get("overflow")
+        pri_wk = pri.get("weekly") or {}
+        if ovf and pri_wk.get("used_pct") is not None and pri_wk.get("hours_left"):
+            used = pri_wk["used_pct"]
+            hours_left = pri_wk["hours_left"]
+            hours_elapsed = max(0.01, 168 - hours_left)
+            if used > 0 and hours_elapsed > 0:
+                # Linear projection: at current average pace, how many
+                # hours until we hit 100%?
+                rate_pct_per_hour = used / hours_elapsed
+                remaining_pct = 100.0 - used
+                if rate_pct_per_hour > 0 and remaining_pct > 0:
+                    hours_to_cap = remaining_pct / rate_pct_per_hour
+                    cap_dt = datetime.now(timezone.utc) + timedelta(hours=hours_to_cap)
+                    cap_local = cap_dt.astimezone(PT)
+                    # "Tue 2pm" style label
+                    cap_label = cap_local.strftime("%a %-I:%M%p").lower()
+                    ovf["primary_cap_eta"] = {
+                        "hours": round(hours_to_cap, 1),
+                        "iso": cap_dt.isoformat(),
+                        "label": cap_label,
+                        "rate_pct_per_hour": round(rate_pct_per_hour, 3),
+                        "will_cap": hours_to_cap < hours_left,  # True if cap before weekly reset
+                    }
+                else:
+                    ovf["primary_cap_eta"] = None
+            else:
+                ovf["primary_cap_eta"] = None
+
+        print(json.dumps({
+            "accounts": accounts_payload,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_pt": datetime.now(timezone.utc).astimezone(PT).strftime("%-I:%M%p").lower(),
+        }))
         return 0
 
     if args.snapshot_only:
@@ -2044,23 +2092,23 @@ def main():
         # normal), because it keeps the turns table fresh for the widget's
         # live-extrapolation path.
         #
-        # Previously, an API failure would `return 1` before the backfill
-        # ran — which meant a 429 storm would silently freeze the turns
-        # table too, and the widget had nothing to project forward from.
-        api_ok = False
-        try:
-            data = get_usage()
-            dbmod.insert_snapshot(
-                conn,
-                ts=datetime.now(timezone.utc).isoformat(),
-                source=args.source,
-                data=data,
-            )
-            api_ok = True
-        except Exception as e:
-            # Surface to launchd stderr log but don't crash-loop and
-            # don't abort — the backfill is independent and still useful.
-            print(f"snapshot failed: {e}", file=sys.stderr)
+        # Multi-account: loop over ACCOUNTS, fetch + insert for each.
+        # Each account's failure is independent — one account's 429
+        # doesn't block the other's snapshot.
+        api_ok = True
+        for acct_id, acct_cfg in ACCOUNTS.items():
+            try:
+                data = get_usage(keychain_service=acct_cfg["keychain"])
+                dbmod.insert_snapshot(
+                    conn,
+                    ts=datetime.now(timezone.utc).isoformat(),
+                    source=args.source,
+                    data=data,
+                    account=acct_id,
+                )
+            except Exception as e:
+                print(f"snapshot failed ({acct_id}): {e}", file=sys.stderr)
+                api_ok = False
         # Respect the backfill lock so we don't stampede the widget's
         # own backfill subprocess. max_age of 60s is generous: launchd
         # runs us every 15 min, so we'll almost always acquire — and if
