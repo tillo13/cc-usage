@@ -1957,7 +1957,14 @@ def main():
         print(json.dumps(get_usage(), indent=2))
         return 0
 
-    conn = dbmod.connect()
+    try:
+        conn = dbmod.connect()
+    except Exception:
+        if args.widget_json or args.snapshot_only:
+            # Widget / launchd must never crash to stderr.
+            print("{}" if args.widget_json else "", end="")
+            return 0
+        raise
 
     if args.widget_json:
         # Strategy: never let the widget paint stale numbers. The
@@ -2035,10 +2042,13 @@ def main():
                 except Exception:
                     continue  # skip this account, try the next
 
-            _extrapolate_live(conn, data, anchor_ts, account=acct_id)
-            accounts_payload[acct_id] = widget_payload(
-                data=data, conn=conn, target=args.target, account=acct_id,
-            )
+            try:
+                _extrapolate_live(conn, data, anchor_ts, account=acct_id)
+                accounts_payload[acct_id] = widget_payload(
+                    data=data, conn=conn, target=args.target, account=acct_id,
+                )
+            except Exception:
+                continue  # skip this account — never let a crash reach stderr
 
         if not accounts_payload:
             print("{}")
