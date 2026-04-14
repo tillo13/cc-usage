@@ -356,6 +356,27 @@ export const className = `
     50%      { opacity: 0.35; transform: scale(0.72); }
   }
 
+  /* ═══ claude2 migration nudge ═══
+     Soft (primary 85–94%): non-animated amber hint.
+     Urgent (primary ≥97%): slow opacity blink demanding action. */
+  .nudge {
+    color: #FFB84D;
+    font-family: "SF Mono", ui-monospace, "JetBrains Mono", monospace;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+  }
+  .nudgeUrgent {
+    color: #FF6B6B;
+    font-family: "SF Mono", ui-monospace, "JetBrains Mono", monospace;
+    font-weight: 800;
+    letter-spacing: 0.02em;
+    animation: cc-nudge 1.4s ease-in-out infinite;
+  }
+  @keyframes cc-nudge {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.35; }
+  }
+
   /* ═══ Custom tooltip ═══
      Native title="" doesn't reliably render in Übersicht's WKWebView, so
      tooltips are absolute :hover divs. Matches the instrument aesthetic:
@@ -497,6 +518,16 @@ export const render = ({ output, error }) => {
   const activeLabel = active.account_label || "Max 20x"
   const standbyIsPrimary = primaryCapped && hasOverflow
 
+  // ── claude2 migration nudge ──
+  // Drives both the Row 1 pre-swap hint and the capped-strip urgent pulse.
+  // Band on primary weekly %: 85–94% = soft hint (pre-swap, primary still active),
+  // ≥97% = urgent pulse (post-swap, migration hasn't finished yet).
+  const primaryWeekPctForNudge = clamp((primary.weekly || {}).used_pct || 0)
+  const nudgeLevel = !hasOverflow ? null
+    : primaryWeekPctForNudge >= 97 ? "urgent"
+    : primaryWeekPctForNudge >= 85 ? "soft"
+    : null
+
   const session = active.session || {}
   const weekly = active.weekly || {}
   const constraint = active.constraint || {}
@@ -515,17 +546,26 @@ export const render = ({ output, error }) => {
   const sessStart = session.started_at_local || "—"
 
   // ── weekly math ──
-  const weekTotal = 168.0
-  const weekLeft = weekly.hours_left != null ? weekly.hours_left : 0
-  const weekElapsed = Math.max(0, weekTotal - weekLeft)
-  const weekTimePct = clamp((weekElapsed / weekTotal) * 100)
+  // Bridge mode: when primary is capped and primary's reset comes before
+  // overflow's own 7d reset, re-anchor the weekly card against primary's
+  // reset (shorter horizon). The real 7d cycle is kept as a secondary hint.
+  const bridge = (weekly.bridge && weekly.bridge.applied) ? weekly.bridge : null
+  const weekLeft = bridge ? bridge.hours_left : (weekly.hours_left != null ? weekly.hours_left : 0)
+  // Dim fill represents how far through the relevant horizon we are.
+  // Bridge mode: horizon = (elapsed since overflow week started) + (hours to primary reset).
+  const bridgeElapsed = bridge ? Math.max(0, 168.0 - (bridge.real_hours_left != null ? bridge.real_hours_left : 168.0)) : 0
+  const bridgeTotal = bridge ? Math.max(0.01, bridgeElapsed + bridge.hours_left) : 168.0
+  const weekElapsed = bridge ? bridgeElapsed : Math.max(0, 168.0 - weekLeft)
+  const weekTimePct = bridge ? clamp((bridgeElapsed / bridgeTotal) * 100) : clamp((weekElapsed / 168.0) * 100)
   const weekQuotaPct = clamp(weekly.used_pct || 0)
   const weekDelta = weekQuotaPct - weekTimePct
-  const weekReset = weekly.reset_time_local || weekly.reset_label || "—"
-  const vsIdeal = weekly.vs_ideal_pct
-  const idealPct = weekly.ideal_pct
-  const projectedPct = weekly.projected_pct
-  const daysLeft = weekly.days_left
+  const weekReset = bridge
+    ? (bridge.reset_time_local || bridge.reset_label || "—")
+    : (weekly.reset_time_local || weekly.reset_label || "—")
+  const vsIdeal = bridge ? bridge.vs_ideal_pct : weekly.vs_ideal_pct
+  const idealPct = bridge ? bridge.ideal_pct : weekly.ideal_pct
+  const projectedPct = bridge ? bridge.projected_pct : weekly.projected_pct
+  const daysLeft = bridge ? bridge.days_left : weekly.days_left
   // Projection status: how far over/under target we'd land at current pace.
   // Treat anything >target+5 as an overshoot worth underlining; shade around target.
   const projDelta = projectedPct != null ? projectedPct - target : null
@@ -538,8 +578,12 @@ export const render = ({ output, error }) => {
   const byDay = Array.isArray(weekly.by_day) ? weekly.by_day : []
   const maxDayH = Math.max(1, ...byDay.map((x) => x.active_hours || 0))
 
-  const safeHours = constraint.tomorrow_active_hours
   const rate = constraint.rate_pct_per_active_hour
+  // In bridge mode, recompute daily active-hour budget against the shorter
+  // horizon (primary reset) — expands headroom correspondingly.
+  const safeHours = (bridge && rate && rate > 0)
+    ? (bridge.safe_pct_per_day / rate)
+    : constraint.tomorrow_active_hours
 
   // ── live sessions (ALL currently-active Claude Code sessions) ──
   // Read directly from ~/.claude/projects/*.jsonl, sorted worst-first.
@@ -649,11 +693,46 @@ export const render = ({ output, error }) => {
               </span>,
               <span key="pu" className="unit">proj</span>,
             ]}
+            {bridge && [
+              <span key="bd" className="dot">·</span>,
+              <span key="bl" className="unit">7d</span>,
+              bridge.real_projected_pct != null && (
+                <span key="bp" className={
+                  bridge.real_projected_pct >= target + 40 ? "crit"
+                  : bridge.real_projected_pct >= target + 10 ? "warn"
+                  : "hint"
+                }>{bridge.real_projected_pct.toFixed(0)}%</span>
+              ),
+              <span key="bu" className="unit">proj</span>,
+              <span key="bv" className="hint">(→{bridge.real_reset_time_local} · {bridge.real_days_left != null ? bridge.real_days_left.toFixed(1) + "d" : "—"})</span>,
+            ]}
+            {!standbyIsPrimary && nudgeLevel && [
+              <span key="nd" className="dot">·</span>,
+              <span key="nu" className="unit">new:</span>,
+              <span key="nv" className={nudgeLevel === "urgent" ? "nudgeUrgent" : "nudge"}>
+                claude2
+              </span>,
+            ]}
           </span>
 
           <div className="tip">
-            <span className="tipHead">weekly quota · 168-hour window</span>
-            <span className="tipKey">resets at  </span><span className="tipVal">{weekReset}</span>{"\n"}
+            <span className="tipHead">weekly quota {bridge ? "· bridge mode" : "· 168-hour window"}</span>
+            {bridge && [
+              <span key="bn1" className="tipNote">
+                Primary account is capped — pacing this overflow account
+                against primary's reset ({bridge.reset_time_local}), not its
+                own 7-day reset. Once primary resets, switch back to
+                `claude` and this account goes dormant until the next cap.
+              </span>,
+              "\n\n",
+            ]}
+            <span className="tipKey">resets at  </span><span className="tipVal">{weekReset}</span>{bridge ? <span className="tipKey">  (bridge horizon)</span> : null}{"\n"}
+            {bridge && [
+              <span key="br1" className="tipKey">7d reset   </span>,
+              <span key="br2" className="tipVal">{bridge.real_reset_time_local}</span>,
+              <span key="br3" className="tipKey">  ({bridge.real_days_left != null ? bridge.real_days_left.toFixed(1) : "—"}d · real cycle, safety net)</span>,
+              "\n",
+            ]}
             <span className="tipKey">time spent </span><span className="tipVal">{fmtHD(weekElapsed)}</span>{"  "}<span className="tipKey">({weekTimePct.toFixed(0)}% of week)</span>{"\n"}
             <span className="tipKey">time left  </span><span className="tipVal">{fmtHD(weekLeft)}</span>{"\n"}
             <span className="tipKey">quota used </span><span className="tipVal">{weekQuotaPct.toFixed(0)}%</span>{"\n"}
@@ -675,7 +754,13 @@ export const render = ({ output, error }) => {
               <span key="p2" className={"tipVal " + projClass}>
                 {projectedPct.toFixed(1)}% by reset
               </span>,
-              <span key="p3" className="tipKey">  (if pace holds)</span>,
+              <span key="p3" className="tipKey">  (if pace holds{bridge ? ", to primary reset" : ""})</span>,
+              "\n",
+            ]}
+            {bridge && bridge.real_projected_pct != null && [
+              <span key="rp1" className="tipKey">projected 7d </span>,
+              <span key="rp2" className="tipVal">{bridge.real_projected_pct.toFixed(1)}%</span>,
+              <span key="rp3" className="tipKey">  (same pace over full 7-day cycle)</span>,
               "\n",
             ]}
             {"\n"}
@@ -1082,6 +1167,11 @@ export const render = ({ output, error }) => {
           }
 
           // ── NORMAL CAPPED MODE: overflow still has headroom ──
+          // Migration nudge: existing CC windows keep billing primary until
+          // closed. Show "close old · claude2 new" front-and-center; pulse
+          // when primary is genuinely over the edge (≥97%).
+          const migrateUrgent = stbWeekQ >= 97
+          const migrateClass = migrateUrgent ? "nudgeUrgent" : "nudge"
           return (
             <div className="row row2">
               <div className="card cardInline">
@@ -1092,11 +1182,12 @@ export const render = ({ output, error }) => {
                     <span key="sc" className="hint">claude</span>,
                     <span key="sd" className="dot">·</span>,
                   ] : [
+                    <span key="mg" className={migrateClass}>▶ close windows · new:</span>,
+                    <span key="mc" className={migrateClass}>claude2</span>,
+                    <span key="md" className="dot">·</span>,
                     <span key="rb" className="unit">resets</span>,
                     <span key="rt" className={resetClass}>{stbReset}</span>,
                     stbDays != null && <span key="rd" className="hint">({stbDays.toFixed(1)}d)</span>,
-                    <span key="rs" className="dot">→</span>,
-                    <span key="rl" className="hint">switch back to claude</span>,
                     <span key="re" className="dot">·</span>,
                   ]}
                   <span className="unit">wk</span>
@@ -1112,6 +1203,13 @@ export const render = ({ output, error }) => {
                   <span className="tipKey">status    </span><span className="tipVal crit">weekly cap reached ({stbWeekQ.toFixed(0)}%)</span>{"\n"}
                   <span className="tipKey">resets at </span><span className="tipVal">{stbReset}</span>{"\n"}
                   <span className="tipKey">days left </span><span className="tipVal">{stbDays != null ? stbDays.toFixed(1) : "—"}</span>{"\n"}
+                  {"\n"}
+                  <span className="tipVal warn">migrate now:</span>{"\n"}
+                  <span className="tipKey">  1. close every open Claude Code window</span>{"\n"}
+                  <span className="tipKey">     (existing windows keep billing primary)</span>{"\n"}
+                  <span className="tipKey">  2. open a new terminal tab</span>{"\n"}
+                  <span className="tipKey">  3. type </span><span className="tipVal">claude2</span><span className="tipKey"> (not claude)</span>{"\n"}
+                  <span className="tipKey">  4. repeat step 2–3 per window you need</span>{"\n"}
                   {"\n"}
                   <span className="tipKey">when it resets:</span>{"\n"}
                   <span className="tipKey">  1. open a new terminal tab</span>{"\n"}

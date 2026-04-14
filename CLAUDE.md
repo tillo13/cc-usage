@@ -128,6 +128,20 @@ This is intentional and documented in the code. Don't add error
 surfacing to the widget render path. If you think the widget should
 paint an error, you're wrong — extend the extrapolation instead.
 
+## Bridge mode (overflow weekly re-anchor)
+
+When primary is capped (≥95%) AND primary's reset is sooner than the
+overflow account's own 7-day reset, the `--widget-json` path attaches a
+`bridge` sub-object to `overflow.weekly` with re-anchored pacing:
+`reset_label` / `days_left` / `ideal_pct` / `projected_pct` /
+`safe_pct_per_day` computed against **primary's reset**, not overflow's
+own 168h cycle. The JSX WEEK card reads from `weekly.bridge.*` when
+`applied=true` and falls back to `weekly.*` otherwise, with the real 7d
+`projected_pct` shown inline for comparison. Do not "clean up" the
+bridge branch when testing in non-capped states — it's dormant by
+design and correctness-critical during the 1–4 day bridge window after
+a cap.
+
 The `--snapshot-only` launchd path ALSO must survive API failures
 without killing the backfill half. The snapshot insert and the
 incremental backfill are independent: an API 429 storm (hours long,

@@ -2087,6 +2087,57 @@ def main():
             else:
                 ovf["primary_cap_eta"] = None
 
+        # ── Bridge mode ──
+        # When primary is capped and primary's reset comes BEFORE overflow's
+        # own 7-day reset, the overflow only needs to bridge until primary
+        # comes back — not last the full week. Re-anchor overflow weekly
+        # pacing against primary's reset (shorter horizon → more headroom).
+        # The real 7d cycle is preserved under `real_*` for fallback display.
+        if ovf and (pri_wk.get("used_pct") or 0) >= 95:
+            ovf_wk = ovf.get("weekly") or {}
+            pri_reset_iso = pri_wk.get("reset_iso")
+            ovf_reset_iso = ovf_wk.get("reset_iso")
+            if pri_reset_iso and ovf_reset_iso and pri_reset_iso < ovf_reset_iso:
+                try:
+                    pri_reset_dt = datetime.fromisoformat(pri_reset_iso.replace("Z", "+00:00"))
+                    ovf_reset_dt = datetime.fromisoformat(ovf_reset_iso.replace("Z", "+00:00"))
+                    now_utc = datetime.now(timezone.utc)
+                    pri_hours_left = max(0.0, (pri_reset_dt - now_utc).total_seconds() / 3600.0)
+                    ovf_cycle_start = ovf_reset_dt - timedelta(hours=168)
+                    cycle_total_h = max(0.01, (pri_reset_dt - ovf_cycle_start).total_seconds() / 3600.0)
+                    elapsed_h = max(0.0, (now_utc - ovf_cycle_start).total_seconds() / 3600.0)
+                    ovf_used = float(ovf_wk.get("used_pct") or 0)
+                    ovf_remaining = max(0.0, 100.0 - ovf_used)
+                    days_left = pri_hours_left / 24.0
+                    safe_per_day = (ovf_remaining / days_left) if days_left > 0 else 0.0
+                    ideal_pct = (elapsed_h / cycle_total_h) * float(args.target) if cycle_total_h > 0 else None
+                    projected_pct = (ovf_used / elapsed_h) * cycle_total_h if elapsed_h > 0 else None
+                    pri_reset_pt = pri_reset_dt.astimezone(PT)
+                    bridge_label = pri_reset_pt.strftime("%-I%p %a").lower()
+                    bridge_time_local = pri_reset_pt.strftime("%-I:%M%p %a").lower()
+                    ovf_wk["bridge"] = {
+                        "applied": True,
+                        "reset_iso": pri_reset_iso,
+                        "reset_label": bridge_label,
+                        "reset_time_local": bridge_time_local,
+                        "hours_left": round(pri_hours_left, 2),
+                        "days_left": round(days_left, 2),
+                        "remaining_pct": round(ovf_remaining, 2),
+                        "safe_pct_per_day": round(safe_per_day, 2),
+                        "ideal_pct": round(ideal_pct, 2) if ideal_pct is not None else None,
+                        "projected_pct": round(projected_pct, 2) if projected_pct is not None else None,
+                        "vs_ideal_pct": round(ovf_used - ideal_pct, 2) if ideal_pct is not None else None,
+                        "real_reset_label": ovf_wk.get("reset_label"),
+                        "real_reset_time_local": ovf_wk.get("reset_time_local"),
+                        "real_days_left": ovf_wk.get("days_left"),
+                        "real_hours_left": ovf_wk.get("hours_left"),
+                        "real_ideal_pct": ovf_wk.get("ideal_pct"),
+                        "real_vs_ideal_pct": ovf_wk.get("vs_ideal_pct"),
+                        "real_projected_pct": ovf_wk.get("projected_pct"),
+                    }
+                except Exception:
+                    pass
+
         print(json.dumps({
             "accounts": accounts_payload,
             "updated_at": datetime.now(timezone.utc).isoformat(),
