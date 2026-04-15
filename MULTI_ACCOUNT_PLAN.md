@@ -1,7 +1,14 @@
 # Multi-Account Strategy — Research & Implementation Plan
 
-**Date:** 2026-04-12
+**Date:** 2026-04-12 (overflow upgraded Pro → Max 20x on 2026-04-15)
 **Context:** Andy consistently exceeds Max 20x weekly allotment (~171% one week, 54% midweek another). Extra usage overage is 50x worse value than subscription tokens. A second account as overflow is dramatically more cost-efficient.
+
+> **2026-04-15 update:** the overflow account was upgraded from Pro
+> ($20/mo) to Max 20x ($200/mo) after burning through Pro's allotment
+> mid-week and being forced into either-pay-overage-or-stop. Total
+> subscription cost is now $400/mo for two symmetric Max 20x accounts.
+> The "Pro relief valve" framing below is historical — both accounts
+> now carry full Max 20x allotments.
 
 ---
 
@@ -41,7 +48,7 @@ Can be disabled/re-enabled at any time in Settings > Usage. Disabling does not a
 | Account | Email | Plan | Monthly cost | Role |
 |---|---|---|---|---|
 | Primary | andytillo (main) | Max 20x | $200/mo | Daily driver, all projects |
-| Overflow | tilloat@gmail.com | Pro | $20/mo | Relief valve when primary hits weekly cap |
+| Overflow | tilloat@gmail.com | Max 20x | $200/mo | Full mirror — kicks in when primary hits weekly cap |
 
 ### Access
 

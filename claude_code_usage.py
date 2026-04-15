@@ -70,7 +70,7 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 # hits its weekly cap — see MULTI_ACCOUNT_PLAN.md for the full rationale.
 ACCOUNTS = {
     "primary":  {"keychain": "Claude Code-credentials",          "label": "Max 20x", "tier": "max_20x"},
-    "overflow": {"keychain": "Claude Code-credentials-bae1e975", "label": "Pro",     "tier": "pro"},
+    "overflow": {"keychain": "Claude Code-credentials-bae1e975", "label": "Max 20x", "tier": "max_20x"},
 }
 
 # Local wall-clock timezone for human-friendly displays ("4:28pm", "Sat Apr 11").

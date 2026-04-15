@@ -63,6 +63,19 @@
 const PYTHON_BIN = "/Users/at/Desktop/code/kicksaw/venv_kicksaw/bin/python3"
 const REPO_ROOT  = "/Users/at/Desktop/code/_infrastructure/cc_usage"
 
+// Overflow account (claude2) renewal date. Set on 2026-04-15 when it was
+// upgraded Pro → Max 20x. Anthropic does not prorate downgrades, so the
+// only meaningful decision window is the ~2 weeks before this date — if
+// the prior month showed overflow rarely needed, downgrading back to Pro
+// saves $180/mo. The widget surfaces an amber nudge once we're inside
+// that window so the renewal doesn't auto-process unnoticed.
+const OVERFLOW_RENEWAL_DATE = "2026-05-14"
+const renewalDaysLeft = () => {
+  const now = new Date()
+  const renewal = new Date(OVERFLOW_RENEWAL_DATE + "T07:00:00Z") // approx midnight PT
+  return Math.ceil((renewal - now) / (1000 * 60 * 60 * 24))
+}
+
 export const command =
   "PATH=/usr/bin:/bin:/usr/sbin:/sbin " +
   `${PYTHON_BIN} ${REPO_ROOT}/claude_code_usage.py --widget-json`
@@ -1113,7 +1126,7 @@ export const render = ({ output, error }) => {
                   </span>
                   <span className="val">
                     <span className={overflowCapped ? "crit" : "warn"}>
-                      {overflowCapped ? "▶ UPGRADE OVERFLOW" : "overflow at " + weekQuotaPct.toFixed(0) + "%"}
+                      {overflowCapped ? "▶ BOTH CAPPED — WAIT OR PAY" : "overflow at " + weekQuotaPct.toFixed(0) + "%"}
                     </span>
                     <span className="dot">·</span>
                     <span className="unit">primary resets</span>
@@ -1140,25 +1153,20 @@ export const render = ({ output, error }) => {
                     {"\n"}
                     <span className="tipVal warn">OPTIONS — pick one:</span>{"\n"}
                     {"\n"}
-                    <span className="tipVal">1. Upgrade tilloat@gmail.com</span>{"\n"}
-                    <span className="tipKey">   log in at claude.ai as tilloat@gmail.com</span>{"\n"}
-                    <span className="tipKey">   → Settings → Subscription → upgrade to:</span>{"\n"}
-                    <span className="tipKey">     • </span><span className="tipVal">Max 5x  ($100/mo)</span><span className="tipKey"> — good for heavy weeks</span>{"\n"}
-                    <span className="tipKey">     • </span><span className="tipVal">Max 20x ($200/mo)</span><span className="tipKey"> — full mirror of primary</span>{"\n"}
-                    {"\n"}
-                    <span className="tipVal">2. Re-enable extra usage on primary</span>{"\n"}
-                    <span className="tipKey">   log in at claude.ai as your main account</span>{"\n"}
-                    <span className="tipKey">   → Settings → Usage → toggle extra usage ON</span>{"\n"}
-                    <span className="tipKey">   ⚠ charges at API rates ($1=$1, ~50x worse)</span>{"\n"}
-                    {"\n"}
-                    <span className="tipVal">3. Wait for primary reset</span>{"\n"}
+                    <span className="tipVal">1. Wait for whichever resets first</span>{"\n"}
                     <span className="tipKey">   primary resets {stbReset}</span>{"\n"}
-                    <span className="tipKey">   use claude (not claude2) after reset</span>{"\n"}
+                    <span className="tipKey">   switch back with </span><span className="tipVal">claude</span><span className="tipKey"> after reset</span>{"\n"}
+                    {"\n"}
+                    <span className="tipVal">2. Re-enable extra usage (last resort)</span>{"\n"}
+                    <span className="tipKey">   pick whichever account resets sooner</span>{"\n"}
+                    <span className="tipKey">   → Settings → Usage → toggle extra usage ON</span>{"\n"}
+                    <span className="tipKey">   ⚠ charges at API rates ($1=$1, ~50x worse</span>{"\n"}
+                    <span className="tipKey">     than subscription tokens)</span>{"\n"}
                     <span className="tipNote">
-                      The Pro plan ($20/mo) is meant as a cheap relief valve
-                      for 1-2 overflow days. If you're consistently burning
-                      through it, upgrading to Max 5x ($100) is 50x better
-                      value than re-enabling extra usage on primary.
+                      Both accounts are Max 20x ($200/mo). When both are
+                      capped you've used ~$10k of API-equivalent value
+                      that week — extra usage from here is pure overage
+                      and best avoided unless the work truly can't wait.
                     </span>
                   </div>
                 </div>
@@ -1191,10 +1199,18 @@ export const render = ({ output, error }) => {
                     <span key="re" className="dot">·</span>,
                   ]}
                   <span className="unit">wk</span>
-                  <span className="crit">{stbWeekQ.toFixed(0)}%</span>
-                  <span className="pbar" style={{ width: "48px" }}>
+                  <span className="hint">claude</span>
+                  <span className="crit">{stbWeekQ.toFixed(2)}%</span>
+                  <span className="pbar" style={{ width: "40px" }}>
                     <span className="fillTime" style={{ width: stbWeekTime + "%" }} />
                     <span className="fillQuota bgCrit" style={{ width: stbWeekQ + "%" }} />
+                  </span>
+                  <span className="dot">│</span>
+                  <span className="hint">claude2</span>
+                  <span className={paceClass(weekDelta)}>{weekQuotaPct.toFixed(2)}%</span>
+                  <span className="pbar" style={{ width: "40px" }}>
+                    <span className="fillTime" style={{ width: weekTimePct + "%" }} />
+                    <span className={"fillQuota " + paceBgClass(weekDelta)} style={{ width: weekQuotaPct + "%" }} />
                   </span>
                 </span>
 
@@ -1218,7 +1234,8 @@ export const render = ({ output, error }) => {
                   <span className="tipNote">
                     The primary account resets to 0% weekly usage at
                     the time shown above. Once it resets, switch back
-                    to save the Pro overflow for next week's cap.
+                    to keep the overflow's Max 20x allotment in reserve
+                    for next week's cap.
                   </span>
                 </div>
               </div>
@@ -1300,6 +1317,44 @@ export const render = ({ output, error }) => {
                   cap. This account absorbs the overflow at subscription
                   rates (~50x better value than extra usage overage).
                   {"\n\n"}alias: claude2='CLAUDE_CONFIG_DIR=~/.claude-alt claude'
+                </span>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
+      {(() => {
+        const dLeft = renewalDaysLeft()
+        if (dLeft > 14 || dLeft < -1) return null
+        const urgent = dLeft <= 7
+        const colorClass = urgent ? "warn" : "hint"
+        return (
+          <div className="row row2">
+            <div className="card cardInline">
+              <span className={"lbl " + (urgent ? "warn" : "")}>claude2 renewal</span>
+              <span className="val">
+                <span className={colorClass}>{dLeft <= 0 ? "today" : dLeft + "d"}</span>
+                <span className="dot">·</span>
+                <span className="unit">{OVERFLOW_RENEWAL_DATE}</span>
+                <span className="dot">·</span>
+                <span className="hint">decide: keep Max 20x or downgrade?</span>
+              </span>
+              <div className="tip">
+                <span className="tipHead">claude2 (overflow) auto-renews {OVERFLOW_RENEWAL_DATE}</span>
+                <span className="tipKey">days left  </span><span className={"tipVal " + colorClass}>{dLeft}</span>{"\n"}
+                <span className="tipKey">cost       </span><span className="tipVal">$200/mo (Max 20x)</span>{"\n"}
+                {"\n"}
+                <span className="tipVal warn">decide before renewal:</span>{"\n"}
+                <span className="tipKey">  • </span><span className="tipVal">keep Max 20x</span><span className="tipKey"> if cap-weeks are routine</span>{"\n"}
+                <span className="tipKey">  • </span><span className="tipVal">downgrade to Pro ($20)</span><span className="tipKey"> if rarely used — saves $180/mo</span>{"\n"}
+                <span className="tipKey">  • </span><span className="tipVal">downgrade to Max 5x ($100)</span><span className="tipKey"> as middle ground</span>{"\n"}
+                {"\n"}
+                <span className="tipNote">
+                  Anthropic does NOT prorate downgrades — they take effect
+                  at next renewal. So the decision window is BEFORE the
+                  renewal date. Check stats.py for actual cap frequency
+                  over the past month before deciding.
                 </span>
               </div>
             </div>

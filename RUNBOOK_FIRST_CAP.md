@@ -1,5 +1,12 @@
 # First-cap runbook — saved Mon Apr 13 evening
 
+> **HISTORICAL — completed 2026-04-15.** This runbook covered the
+> first-ever Max 20x cap and the Pro → Max 5x upgrade plan for the
+> overflow account. In practice the overflow was upgraded straight to
+> Max 20x ($200/mo) on Apr 15, skipping the Max 5x intermediate step.
+> Both accounts are now Max 20x; see `MULTI_ACCOUNT_PLAN.md` for the
+> current state. Kept here as a record of the first-cap experience.
+
 Context for morning-you: this is the first time hitting the Max 20x
 weekly cap on this new heavier work schedule. Primary was at ~90% at
 6pm Mon, expected to land ~93% by bedtime after a 1h wrap-up.
