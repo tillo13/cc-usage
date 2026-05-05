@@ -9,6 +9,9 @@ data/*.db-wal
 # Backfill stampede lockfile — mtime-based, regenerated on demand.
 data/.backfill.lock
 
+# PIDs that hung lsof (stuck remote mounts etc.) — GC'd against live PIDs.
+data/.lsof_blocklist
+
 # ─── python caches ─────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]

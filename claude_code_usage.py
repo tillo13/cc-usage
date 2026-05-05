@@ -1194,6 +1194,60 @@ def _scan_session_file(path):
     }
 
 
+_LSOF_BLOCKLIST_PATH = Path(__file__).resolve().parent / "data" / ".lsof_blocklist"
+_LSOF_PER_PID_TIMEOUT_SEC = 2.0
+
+
+def _load_lsof_blocklist(live_pids):
+    # Returns the set of PIDs we've previously seen hang lsof. Garbage-collects
+    # entries whose PID is no longer alive (so a recycled PID gets a fresh shot).
+    if not _LSOF_BLOCKLIST_PATH.exists():
+        return set()
+    try:
+        raw = _LSOF_BLOCKLIST_PATH.read_text().split()
+    except OSError:
+        return set()
+    return {p for p in raw if p in live_pids}
+
+
+def _save_lsof_blocklist(blocked):
+    try:
+        _LSOF_BLOCKLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _LSOF_BLOCKLIST_PATH.write_text("\n".join(sorted(blocked)))
+    except OSError:
+        pass
+
+
+def _lsof_cwd_for_pid(pid):
+    # Returns the cwd string for one PID, or None if lsof times out / fails.
+    # Each PID gets its own subprocess so a single stuck PID can't poison the
+    # batch. We use Popen + communicate(timeout=...) instead of subprocess.run
+    # so we can detect the hang and return None even if the lsof child is
+    # itself stuck in an uninterruptible kernel syscall — in that case the
+    # child leaks (SIGKILL can't reap a U-state process) but the caller
+    # returns promptly. The PID gets blocklisted so we won't keep spawning
+    # leaked lsof children against it on every widget refresh.
+    try:
+        p = subprocess.Popen(
+            ["lsof", "-a", "-p", pid, "-d", "cwd", "-Fn"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        out, _ = p.communicate(timeout=_LSOF_PER_PID_TIMEOUT_SEC)
+    except subprocess.TimeoutExpired:
+        try:
+            p.kill()
+        except OSError:
+            pass
+        return None
+    for line in out.splitlines():
+        if line.startswith("n/"):
+            return line[1:]
+    return None
+
+
 def _live_claude_project_dirs():
     """Return {project_dir_name: live_process_count} for every project where
     a `claude` CLI process is currently running.
@@ -1210,12 +1264,24 @@ def _live_claude_project_dirs():
          to the version string "2.1.101" shortly after launch, so pgrep
          matches inconsistently. The p_comm field stays as "claude" though,
          so ps -o comm is the stable signal.)
-      2. `lsof -a -p PID,... -d cwd -Fn` → cwd for each live PID in one call.
-      3. Encode each cwd to its ~/.claude/projects/ subdir name by replacing
+      2. Per-PID `lsof -p PID -d cwd -Fn` in parallel, each with a 2s timeout.
+         A bulk `lsof -p A,B,C` is fatal when one Claude window's cwd or an
+         open FD lives on a stuck remote mount (sshfs, SMB to a Windows box,
+         a wedged ControlMaster) — the lsof process enters uninterruptible
+         state, Python's `timeout=` fires SIGKILL, the kernel can't reap a
+         U-state process, so `os.waitpid` blocks the widget forever and the
+         menu bar freezes on "loading…". Per-PID isolates the blast radius
+         to one bad session.
+      3. PIDs that hang are recorded in `data/.lsof_blocklist` and skipped
+         on subsequent calls — otherwise the widget (which refreshes every
+         few seconds) would keep spawning leaked lsof children at a steady
+         rate against the same stuck PID. The blocklist is GC'd against the
+         live PID set so a closed/recycled PID gets a fresh shot.
+      4. Encode each cwd to its ~/.claude/projects/ subdir name by replacing
          both "/" and "_" with "-" (Claude Code's encoding rule).
 
-    Returns an empty dict if `ps` or `lsof` fail — in which case the caller
-    falls back to pure mtime-based filtering (old behavior).
+    Returns an empty dict if `ps` fails — in which case the caller falls
+    back to pure mtime-based filtering (old behavior).
     """
     try:
         ps_out = subprocess.run(
@@ -1232,24 +1298,26 @@ def _live_claude_project_dirs():
             pids.append(parts[0])
 
     if not pids:
+        _save_lsof_blocklist(set())
         return {}
 
-    try:
-        lsof_out = subprocess.run(
-            ["lsof", "-a", "-p", ",".join(pids), "-d", "cwd", "-Fn"],
-            capture_output=True, text=True, timeout=3,
-        ).stdout
-    except (subprocess.SubprocessError, FileNotFoundError, OSError):
-        return {}
+    blocked = _load_lsof_blocklist(set(pids))
+    to_query = [p for p in pids if p not in blocked]
+
+    from concurrent.futures import ThreadPoolExecutor
 
     dirs = {}
-    # -Fn output is one field per line with a single-char type prefix:
-    #   pPID / fcwd / nPATH. We only want the n-lines that are absolute paths.
-    for line in lsof_out.splitlines():
-        if line.startswith("n/"):
-            cwd = line[1:]
+    if to_query:
+        with ThreadPoolExecutor(max_workers=min(len(to_query), 8)) as pool:
+            results = list(pool.map(_lsof_cwd_for_pid, to_query))
+        for pid, cwd in zip(to_query, results):
+            if cwd is None:
+                blocked.add(pid)
+                continue
             encoded = cwd.replace("/", "-").replace("_", "-")
             dirs[encoded] = dirs.get(encoded, 0) + 1
+
+    _save_lsof_blocklist(blocked)
     return dirs
 
 
