@@ -201,6 +201,7 @@ def _extract_assistant(entry, source_file, account="primary"):
         "ephemeral_5m_input_tokens":   _int_or_zero(cache_creation.get("ephemeral_5m_input_tokens")),
         "service_tier":                usage.get("service_tier"),
         "is_sidechain":                1 if entry.get("isSidechain") else 0,
+        "agent_type":                  entry.get("agentType"),
         "cc_version":                  entry.get("version"),
         "source_file":                 source_file,
         "account":                     account,

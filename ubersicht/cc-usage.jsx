@@ -397,6 +397,21 @@ export const className = `
     background: rgba(184, 200, 224, 0.18);
     flex-shrink: 0;
   }
+  .winCost {
+    font-size: 9px;
+    font-weight: 600;
+    color: #8FA3BF;
+    font-variant-numeric: tabular-nums;
+  }
+  .winAgents {
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    color: #B589FF;
+    padding: 1px 4px 0 4px;
+    border: 1px solid currentColor;
+    line-height: 1;
+  }
 
   /* Pace pill — tiny text chip after each bar */
   .pill {
@@ -820,6 +835,12 @@ export const render = ({ output, error }) => {
                 {s.context_k != null ? (s.context_k >= 100 ? s.context_k.toFixed(0) : s.context_k.toFixed(1)) : "—"}k
               </span>
               <span className={"winPct " + s._cls}>{s._pct.toFixed(0)}%</span>
+              {s.cost_per_reply_usd != null && s.cost_per_reply_usd > 0 && (
+                <span className="winCost">${s.cost_per_reply_usd.toFixed(2)}/r</span>
+              )}
+              {s.agents_active && (
+                <span className="winAgents" title={"workflow / subagent fan-out — " + s.agent_turns + " agent turns" + (s.agent_types && s.agent_types.length ? " (" + s.agent_types.join(", ") + ")" : "")}>⚙ {s.agent_turns}</span>
+              )}
               {s._flag && <span className={"winFlag " + s._cls}>{s._flag}</span>}
             </span>
           ))}

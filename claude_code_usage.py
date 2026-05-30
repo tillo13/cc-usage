@@ -1337,6 +1337,9 @@ def _scan_session_file(path):
     last_model = None
     project_cwd = None
     session_id = None
+    session_cost = 0.0      # cumulative re-read floor cost across the session
+    agent_turns = 0         # sidechain / subagent turns = workflow / ultracode fan-out
+    agent_types = set()     # distinct agentType labels (Explore, general-purpose, …)
     try:
         with open(path, "rb") as fh:
             for raw in fh:
@@ -1358,8 +1361,14 @@ def _scan_session_file(path):
                 if obj.get("type") != "assistant":
                     continue
                 # Sidechain (Task subagent) turns don't count toward the
-                # user-facing "my session is long" feeling.
-                if obj.get("isSidechain"):
+                # user-facing "my session is long" feeling — but they ARE the
+                # signature of workflow / ultracode fan-out, so we count them
+                # separately to flag which window is running agents.
+                at = obj.get("agentType")
+                if obj.get("isSidechain") or at:
+                    agent_turns += 1
+                    if at:
+                        agent_types.add(at)
                     continue
                 turns += 1
                 msg = obj.get("message") or {}
@@ -1371,6 +1380,7 @@ def _scan_session_file(path):
                 )
                 if ctx > 0:
                     last_ctx = ctx
+                    session_cost += ctx * _OPUS_CACHE_READ_USD_PER_TOKEN
                 model = msg.get("model")
                 if model:
                     last_model = model
@@ -1392,6 +1402,10 @@ def _scan_session_file(path):
         "context_tokens": last_ctx,
         "context_k": round(last_ctx / 1000, 1) if last_ctx else None,
         "cost_per_reply_usd": round(_cost_per_reply_usd(last_ctx), 4),
+        "session_cost_usd": round(session_cost, 2),
+        "agent_turns": agent_turns,
+        "agent_types": sorted(agent_types),
+        "agents_active": agent_turns > 0,
         "model": last_model,
     }
 

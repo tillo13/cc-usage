@@ -84,6 +84,7 @@ CREATE TABLE IF NOT EXISTS turns (
     ephemeral_5m_input_tokens       INTEGER,
     service_tier                    TEXT,
     is_sidechain                    INTEGER,               -- 0/1
+    agent_type                      TEXT,                  -- subagent/workflow agentType (NULL on normal turns)
     cc_version                      TEXT,                  -- Claude Code version string
     source_file                     TEXT                   -- jsonl path (for auditing)
 );
@@ -191,6 +192,9 @@ _MIGRATIONS = [
     # Multi-account support: tag each snapshot/turn with its account.
     ("snapshots", "account",          "TEXT"),
     ("turns",     "account",          "TEXT"),
+    # agentType on subagent/workflow turns (Explore, general-purpose, …) —
+    # the signature of ultracode / dynamic-workflow fan-out. NULL on normal turns.
+    ("turns",     "agent_type",       "TEXT"),
 ]
 
 
