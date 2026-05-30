@@ -771,6 +771,20 @@ export const render = ({ output, error }) => {
   const byDay = Array.isArray(weekly.by_day) ? weekly.by_day : []
   const maxDayH = Math.max(1, ...byDay.map((x) => x.active_hours || 0))
 
+  // Weekly burn trend — "how hot am I running vs my own history". Bars are
+  // cost-weighted token burn (comparable across the SpaceX limit change, unlike
+  // quota %). Current (partial) week is highlighted; "heat" compares it to the
+  // median of prior complete weeks.
+  const weekTrend = Array.isArray(weekly.trend) ? weekly.trend : []
+  const maxWeekEff = Math.max(1, ...weekTrend.map((w) => w.eff_mtok || 0))
+  const curWeek = weekTrend.find((w) => w.is_current)
+  const priorEff = weekTrend.filter((w) => !w.is_current && (w.eff_mtok || 0) > 0)
+    .map((w) => w.eff_mtok).sort((a, b) => a - b)
+  const typicalEff = priorEff.length ? priorEff[Math.floor(priorEff.length / 2)] : 0
+  const heatRatio = (curWeek && typicalEff) ? curWeek.eff_mtok / typicalEff : null
+  const heatWord = heatRatio == null ? "" : heatRatio >= 1.25 ? "hot" : heatRatio >= 0.8 ? "typical" : "light"
+  const heatCls = heatRatio == null ? "hint" : heatRatio >= 1.25 ? "warn" : heatRatio >= 0.8 ? "num" : "good"
+
   const rate = constraint.rate_pct_per_active_hour
   // In bridge mode, recompute daily active-hour budget against the shorter
   // horizon (primary reset) — expands headroom correspondingly.
@@ -1090,6 +1104,61 @@ export const render = ({ output, error }) => {
             </span>
           </div>
         </div>
+
+        {/* WEEKS — 8-week burn trend (cost-weighted). "How hot vs my usual." */}
+        {weekTrend.length > 0 && [
+          <span key="wkrule" className="rule" />,
+          <div key="wkcard" className="card cardInline">
+            <span className="lbl">weeks</span>
+            <span className="spark">
+              {weekTrend.map((w) => {
+                const pct = ((w.eff_mtok || 0) / maxWeekEff) * 100
+                const barH = (w.eff_mtok || 0) > 0 ? Math.max(2, (pct / 100) * 12) : null
+                return (
+                  <span key={w.week_end} className="sparkCell">
+                    <span className={"sparkLabel " + (w.is_current ? "sparkLabelToday" : "")}>
+                      {(w.week_end.split("/")[1] || "")}
+                    </span>
+                    {barH != null ? (
+                      <span
+                        className={"sparkBar " + (w.is_current ? "sparkBarToday" : "")}
+                        style={{ height: barH + "px" }}
+                      />
+                    ) : <span className="sparkEmpty" />}
+                  </span>
+                )
+              })}
+            </span>
+            {heatWord && [
+              <span key="hw" className="dot">·</span>,
+              <span key="hv" className={heatCls}>{heatWord}</span>,
+              heatRatio != null && <span key="hr" className="hint">{heatRatio.toFixed(1)}× median</span>,
+            ]}
+
+            <div className="tip">
+              <span className="tipHead">weekly burn trend · cost-weighted</span>
+              {weekTrend.map((w) => {
+                const mark = w.is_current ? "●" : " "
+                const pk = w.peak_pct != null ? w.peak_pct + "%" : "—"
+                return (
+                  <span key={w.week_end}>
+                    <span className={w.is_current ? "tipVal good" : "tipKey"}>
+                      {mark} {String(w.week_end).padStart(5)}  {String(w.eff_mtok).padStart(5)} eff  {String(w.turns.toLocaleString()).padStart(6)}t  peak {pk.padStart(4)}
+                    </span>
+                    {"\n"}
+                  </span>
+                )
+              })}
+              <span className="tipNote">
+                Bar = cost-weighted token burn that week (output 5×, cache-read
+                0.1×) — a limit-independent "how hard did I run" gauge. Quota %
+                isn't comparable across the May SpaceX limit increase, so burn is
+                the honest trend. "peak %" is the authoritative snapshot max where
+                the poller had data (— = gap, e.g. the 5/11–5/30 outage).
+              </span>
+            </div>
+          </div>,
+        ]}
 
         <span className="rule" />
 

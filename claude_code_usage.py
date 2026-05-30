@@ -2176,6 +2176,40 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET, account="primary
                 cur_date += timedelta(days=1)
             weekly["by_day"] = by_day
 
+            # Weekly burn trend — last 8 weeks on the 168h reset cadence. Tracks
+            # "how hot am I running" via cost-weighted tokens, which (unlike
+            # quota %, confounded by the May SpaceX limit increase) is comparable
+            # week-to-week. Snapshot peak % attached where the poller had data.
+            # ROG turns count here too (tagged account=primary — same quota).
+            reset_dt = _parse_iso(weekly["reset_iso"])
+            trend = []
+            if reset_dt:
+                for k in range(8, 0, -1):
+                    hi = reset_dt - timedelta(hours=168 * (k - 1))
+                    lo = hi - timedelta(hours=168)
+                    tr = conn.execute(
+                        f"""SELECT COUNT(*) t,
+                            COALESCE(SUM(input_tokens),0) i, COALESCE(SUM(output_tokens),0) o,
+                            COALESCE(SUM(cache_creation_input_tokens),0) cc,
+                            COALESCE(SUM(cache_read_input_tokens),0) cr
+                            FROM turns WHERE ts >= ? AND ts < ? AND is_sidechain = 0 {_acct_where}""",
+                        (lo.isoformat(), hi.isoformat()) + _acct_bind,
+                    ).fetchone()
+                    eff = (tr["i"] + tr["o"] * 5 + tr["cc"] * 1.25 + tr["cr"] * 0.1) / 1_000_000
+                    pk = conn.execute(
+                        "SELECT MAX(seven_day_pct) p FROM snapshots "
+                        "WHERE ts >= ? AND ts < ? AND COALESCE(account,'primary') = ?",
+                        (lo.isoformat(), hi.isoformat(), account),
+                    ).fetchone()
+                    trend.append({
+                        "week_end": hi.astimezone(PT).strftime("%-m/%-d"),
+                        "turns": tr["t"],
+                        "eff_mtok": round(eff),
+                        "peak_pct": round(pk["p"]) if pk and pk["p"] is not None else None,
+                        "is_current": k == 1,
+                    })
+            weekly["trend"] = trend
+
     # "Today" stats — bucketed in local TZ so a day = the user's actual workday, not UTC
     pt_now = datetime.now(timezone.utc).astimezone(PT)
     pt_midnight = pt_now.replace(hour=0, minute=0, second=0, microsecond=0)
