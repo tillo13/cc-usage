@@ -2107,6 +2107,23 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET, account="primary
             weekly["projected_pct"] = round(
                 weekly["used_pct"] * (168 / hours_elapsed), 1
             )
+            # Utilization gauge — "am I getting my $200's worth?". headroom_x =
+            # how much harder you could run (more windows / ultracode) for the
+            # rest of the week and still just land at target. Built on
+            # projected_pct, so it's pace- AND time-of-day-aware: early week it's
+            # a prospective "ramp up N×", near reset it reflects the locked-in
+            # week. Capped at 9.9 for display. status flips COLD when you're
+            # under-using the plan you pay for; HOT warns of overage ($) risk.
+            proj = weekly["projected_pct"] or 0.0
+            if proj > 0:
+                weekly["headroom_x"] = round(min(9.9, target / proj), 2)
+                r = proj / target if target else 0
+                weekly["utilization_status"] = (
+                    "cold" if r < 0.6 else
+                    "warm" if r < 0.9 else
+                    "on-target" if r <= 1.1 else
+                    "hot"
+                )
             week_start = _week_start_iso(weekly["reset_iso"])
             if week_start:
                 ws = _active_hour_stats(conn, week_start, account=account)

@@ -785,6 +785,16 @@ export const render = ({ output, error }) => {
   const heatWord = heatRatio == null ? "" : heatRatio >= 1.25 ? "hot" : heatRatio >= 0.8 ? "typical" : "light"
   const heatCls = heatRatio == null ? "hint" : heatRatio >= 1.25 ? "warn" : heatRatio >= 0.8 ? "num" : "good"
 
+  // Utilization gauge — "am I getting my $200's worth?". COLD = leaving the plan
+  // unused (amber nudge to spin up more windows/ultracode); on-target = using it
+  // well; HOT = projected past 99% → overage ($) risk. headroom_x = how much
+  // harder you could run for the rest of the week and still just hit target.
+  const headroomX = weekly.headroom_x
+  const utilStatus = weekly.utilization_status   // cold | warm | on-target | hot
+  const utilCls = utilStatus === "cold" ? "warn"
+    : utilStatus === "hot" ? "crit"
+    : utilStatus === "on-target" ? "good" : "num"
+
   const rate = constraint.rate_pct_per_active_hour
   // In bridge mode, recompute daily active-hour budget against the shorter
   // horizon (primary reset) — expands headroom correspondingly.
@@ -959,9 +969,16 @@ export const render = ({ output, error }) => {
               )}
             </span>
             <span className={paceClass(weekDelta)}>{weekQuotaPct.toFixed(0)}%</span>
-            {/* vs-ideal + projection demoted post-SpaceX — weekly quota no longer
-               binds (projects ~19% on a hard week), so the pacing noise is gone
-               from the visible row. Full detail still lives in the tooltip below. */}
+            {/* Utilization gauge replaces the old "running hot" pacing: post-SpaceX
+               the goal is to USE the $200 plan, not avoid the cap. COLD nags you to
+               run more; HOT warns of overage. */}
+            {utilStatus && [
+              <span key="ud" className="dot">·</span>,
+              <span key="us" className={utilCls}>{utilStatus}</span>,
+              headroomX != null && utilStatus !== "on-target" && (
+                <span key="ux" className="hint">{headroomX}× room</span>
+              ),
+            ]}
             {bridge && [
               <span key="bd" className="dot">·</span>,
               <span key="bl" className="unit">7d</span>,
