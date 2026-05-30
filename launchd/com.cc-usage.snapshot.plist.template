@@ -35,8 +35,8 @@
     <array>
         <string>__PYTHON_BIN__</string>
         <string>__REPO_ROOT__/claude_code_usage.py</string>
-        <string>`snapshot-only`</string>
-        <string>`source`</string>
+        <string>--snapshot-only</string>
+        <string>--source</string>
         <string>launchd</string>
     </array>
 
