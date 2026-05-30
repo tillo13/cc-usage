@@ -6,7 +6,7 @@ Anthropic Max-plan drift validation.
 Data sources:
   1. Live API: GET https://api.anthropic.com/api/oauth/usage — Anthropic's
      authoritative weekly/session quota (% utilization + reset timestamps)
-  2. Local SQLite at _infrastructure/cc_usage/data/claude_usage.db — backfilled
+  2. Local SQLite at _local_infrastructure/cc_usage/data/claude_usage.db — backfilled
      per-turn token counts parsed from ~/.claude/projects/*/*.jsonl
 
 Each CLI invocation records a fresh snapshot to the `snapshots` table, so
@@ -41,6 +41,7 @@ import argparse
 import getpass
 import json
 import os
+import signal
 import subprocess
 import sys
 from collections import defaultdict
@@ -51,7 +52,7 @@ from zoneinfo import ZoneInfo
 import requests
 
 # Sibling import — claude_usage_db.py lives next to this file in
-# _infrastructure/cc_usage/. Add our own directory to sys.path so the import
+# _local_infrastructure/cc_usage/. Add our own directory to sys.path so the import
 # works no matter where the interpreter is invoked from (launchd, zshrc alias,
 # cron, or a `cd elsewhere && python3 /path/to/claude_code_usage.py`).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -70,7 +71,12 @@ KEYCHAIN_SERVICE = "Claude Code-credentials"
 # hits its weekly cap — see MULTI_ACCOUNT_PLAN.md for the full rationale.
 ACCOUNTS = {
     "primary":  {"keychain": "Claude Code-credentials",          "label": "Max 20x", "tier": "max_20x"},
-    "overflow": {"keychain": "Claude Code-credentials-bae1e975", "label": "Max 20x", "tier": "max_20x"},
+    # claude2 downgraded Max 20x → Pro on 2026-05-15 (as scheduled 2026-04-26).
+    # Confirmed executed 2026-05-30: 239 overflow turns hit 99% of the 5h session
+    # while 901 primary turns sat at ~4% — overflow's ceiling is ~1/20th, i.e. Pro.
+    # The API exposes no tier field, so this label is the source of truth. If
+    # claude2 is ever bumped back to Max, flip both here AND OVERFLOW_DOWNGRADE_SCHEDULED in the jsx.
+    "overflow": {"keychain": "Claude Code-credentials-bae1e975", "label": "Pro", "tier": "pro"},
 }
 
 # Local wall-clock timezone for human-friendly displays ("4:28pm", "Sat Apr 11").
@@ -78,6 +84,12 @@ ACCOUNTS = {
 # Defaults to America/Los_Angeles to match the Anthropic quota reset convention.
 PT = ZoneInfo(os.environ.get("CC_USAGE_TZ", "America/Los_Angeles"))
 DEFAULT_TARGET = 99.0
+
+# Anchor older than this (sec) means the launchd snapshot poller has likely
+# died — the widget should dim + tag the reading as stale instead of trusting
+# the extrapolation. 90 min = 6 missed 15-min polls; comfortably past transient
+# API 429 storms but well short of the multi-hour drift that hides a dead poller.
+STALE_ANCHOR_SEC = 90 * 60
 
 
 # ---------- auth + fetch ----------
@@ -120,6 +132,114 @@ def _parse_iso(ts):
     if not ts:
         return None
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+
+
+def _mac_health_snapshot():
+    """Cheap Mac vitals for the widget (load avg, hot procs, top hog, RAM%).
+
+    Wraps every shell call so a transient failure can never crash the widget.
+    Returns None when nothing useful could be read.
+    Total cost: ~30-80ms (no iostat sampling, just instant reads).
+    """
+    out = {}
+    try:
+        r = subprocess.run(["sysctl", "-n", "hw.physicalcpu", "vm.loadavg"],
+                           capture_output=True, text=True, timeout=2)
+        lines = r.stdout.strip().splitlines()
+        out["cores"] = int(lines[0])
+        # vm.loadavg format: "{ 1.23 4.56 7.89 }"
+        parts = lines[1].replace("{", "").replace("}", "").split()
+        out["load_1min"] = float(parts[0])
+    except Exception:
+        return None
+    try:
+        r = subprocess.run(["ps", "-axro", "%cpu,comm"],
+                           capture_output=True, text=True, timeout=3)
+        rows = []
+        for ln in r.stdout.splitlines()[1:]:  # skip header
+            ln = ln.strip()
+            if not ln:
+                continue
+            head, _, cmd = ln.partition(" ")
+            try:
+                pct = float(head)
+            except ValueError:
+                continue
+            if not cmd:
+                continue
+            # Trim path prefix; keep last segment for short display.
+            short = cmd.rsplit("/", 1)[-1]
+            rows.append((pct, short))
+        # Drop self so the widget doesn't perpetually accuse itself.
+        self_name = Path(sys.argv[0]).name
+        rows = [(p, n) for (p, n) in rows
+                if self_name not in n and "claude_code_usage" not in n]
+        rows.sort(reverse=True)
+        out["hot_count"] = sum(1 for p, _ in rows if p >= 10.0)
+        if rows:
+            top_pct, top_name = rows[0]
+            out["top_pct"] = round(top_pct, 1)
+            out["top_name"] = top_name
+        else:
+            out["top_pct"] = 0.0
+            out["top_name"] = None
+        # Top 8 for the hover panel (includes the lower entries so the user
+        # can see the second/third offenders, not just the headline hog).
+        out["top_procs"] = [
+            {"name": n[:28], "pct": round(p, 1)}
+            for (p, n) in rows[:8]
+        ]
+    except Exception:
+        out.setdefault("hot_count", 0)
+        out.setdefault("top_pct", 0.0)
+        out.setdefault("top_name", None)
+    try:
+        r = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=2)
+        page_size = 4096
+        stats = {}
+        for ln in r.stdout.splitlines():
+            if ln.startswith("Mach Virtual Memory Statistics"):
+                # "(page size of 16384 bytes)" — extract if present
+                if "page size of" in ln:
+                    try:
+                        page_size = int(ln.split("page size of")[1].split()[0])
+                    except Exception:
+                        pass
+                continue
+            if ":" in ln:
+                k, _, v = ln.partition(":")
+                v = v.strip().rstrip(".")
+                try:
+                    stats[k.strip()] = int(v)
+                except ValueError:
+                    pass
+        free = stats.get("Pages free", 0)
+        active = stats.get("Pages active", 0)
+        inactive = stats.get("Pages inactive", 0)
+        wired = stats.get("Pages wired down", 0)
+        compressed = stats.get("Pages occupied by compressor", 0)
+        speculative = stats.get("Pages speculative", 0)
+        total_pages = free + active + inactive + wired + compressed + speculative
+        if total_pages > 0:
+            used_pages = active + wired + compressed
+            out["ram_used_pct"] = round(100.0 * used_pages / total_pages, 1)
+            out["ram_used_gb"] = round(used_pages * page_size / (1024 ** 3), 1)
+            out["ram_total_gb"] = round(total_pages * page_size / (1024 ** 3), 1)
+    except Exception:
+        pass
+    # Severity band — JSX uses this to decide red/amber/normal.
+    cores = out.get("cores", 8)
+    load = out.get("load_1min", 0.0)
+    top_pct = out.get("top_pct", 0.0)
+    if load >= cores * 4 or top_pct >= 200:
+        out["band"] = "crit"
+    elif load >= cores * 2 or top_pct >= 100:
+        out["band"] = "warn"
+    elif load >= cores or top_pct >= 50:
+        out["band"] = "elevated"
+    else:
+        out["band"] = "ok"
+    return out
 
 
 def _fmt_reset(iso_ts):
@@ -358,6 +478,88 @@ def _active_hour_stats(conn, since_iso, project_filter=None, account=None):
         "active_hours": row["active_hours"] or 0,
         "turns": row["turns"] or 0,
         "tokens": row["tokens"] or 0,
+    }
+
+
+def _burn_contributors(conn, hours=24, account="primary"):
+    """
+    Mirrors the "What's contributing to your limits usage?" panel in
+    `claude /usage` — four cost-weighted bands over the last 24h:
+      - ctx_over_150k_pct   share of $-burn from turns whose context ≥150k
+      - long_session_pct    share from sessions with ≥8h wall span
+      - parallel_pct        share from minutes where ≥4 sessions ran in parallel
+      - subagent_pct        share from sessions where ≥20% of burn was sidechain
+    Cost weight: output*5 + cache_creation*1.25 + input*1 + cache_read*0.1
+    (rough Anthropic per-Mtok price ratios, scale-free).
+    """
+    from collections import defaultdict
+    since = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    rows = conn.execute(
+        """
+        SELECT session_id, ts,
+               COALESCE(input_tokens,0)                AS inp,
+               COALESCE(output_tokens,0)               AS outp,
+               COALESCE(cache_creation_input_tokens,0) AS cc,
+               COALESCE(cache_read_input_tokens,0)     AS cr,
+               COALESCE(is_sidechain,0)                AS sc
+        FROM turns
+        WHERE ts >= ? AND COALESCE(account,'primary') = ?
+        """,
+        (since, account),
+    ).fetchall()
+    if not rows:
+        return None
+
+    def burn(r):
+        return r["outp"] * 5.0 + r["cc"] * 1.25 + r["inp"] * 1.0 + r["cr"] * 0.1
+
+    total = sum(burn(r) for r in rows)
+    if total <= 0:
+        return None
+
+    high_ctx = sum(burn(r) for r in rows if (r["inp"] + r["cr"]) >= 150_000)
+
+    sess_span = {}
+    sess_burn = defaultdict(float)
+    sess_sc_burn = defaultdict(float)
+    for r in rows:
+        sid = r["session_id"]
+        ts = _parse_iso(r["ts"])
+        if ts is None:
+            continue
+        if sid in sess_span:
+            lo, hi = sess_span[sid]
+            sess_span[sid] = (min(lo, ts), max(hi, ts))
+        else:
+            sess_span[sid] = (ts, ts)
+        b = burn(r)
+        sess_burn[sid] += b
+        if r["sc"]:
+            sess_sc_burn[sid] += b
+
+    long_sess_burn = sum(
+        sess_burn[sid]
+        for sid, (lo, hi) in sess_span.items()
+        if (hi - lo).total_seconds() >= 8 * 3600
+    )
+    sub_heavy_burn = sum(
+        sess_burn[sid]
+        for sid, b in sess_burn.items()
+        if b > 0 and sess_sc_burn[sid] / b >= 0.20
+    )
+
+    minute_sess = defaultdict(set)
+    for r in rows:
+        minute_sess[r["ts"][:16]].add(r["session_id"])
+    parallel_burn = sum(burn(r) for r in rows if len(minute_sess[r["ts"][:16]]) >= 4)
+
+    pct = lambda v: int(round(v / total * 100))
+    return {
+        "ctx_over_150k_pct": pct(high_ctx),
+        "long_session_pct": pct(long_sess_burn),
+        "parallel_pct": pct(parallel_burn),
+        "subagent_pct": pct(sub_heavy_burn),
+        "window_hours": hours,
     }
 
 
@@ -1196,24 +1398,49 @@ def _scan_session_file(path):
 
 _LSOF_BLOCKLIST_PATH = Path(__file__).resolve().parent / "data" / ".lsof_blocklist"
 _LSOF_PER_PID_TIMEOUT_SEC = 2.0
+# How long a PID stays blocklisted before we re-probe it. A transient lsof
+# hang (sshfs blip, mount stall) shouldn't permanently blind the widget to a
+# still-running window — re-probe after the cooldown and only re-blocklist if
+# lsof hangs again.
+_LSOF_BLOCKLIST_COOLDOWN_SEC = 300.0
 
 
 def _load_lsof_blocklist(live_pids):
-    # Returns the set of PIDs we've previously seen hang lsof. Garbage-collects
-    # entries whose PID is no longer alive (so a recycled PID gets a fresh shot).
+    # Returns {pid: first_blocked_ts} for PIDs still alive and still inside
+    # the cooldown window. Entries are stored as `pid:ts` lines; legacy
+    # bare-`pid` lines (from the prior format) are dropped on read so a stale
+    # permanent block doesn't survive the upgrade.
     if not _LSOF_BLOCKLIST_PATH.exists():
-        return set()
+        return {}
     try:
         raw = _LSOF_BLOCKLIST_PATH.read_text().split()
     except OSError:
-        return set()
-    return {p for p in raw if p in live_pids}
+        return {}
+    import time
+    now = time.time()
+    out = {}
+    for entry in raw:
+        if ":" not in entry:
+            continue  # legacy permanent-block entry — discard
+        pid, _, ts = entry.partition(":")
+        if pid not in live_pids:
+            continue
+        try:
+            ts_f = float(ts)
+        except ValueError:
+            continue
+        if now - ts_f > _LSOF_BLOCKLIST_COOLDOWN_SEC:
+            continue  # cooldown expired — give this PID a fresh shot
+        out[pid] = ts_f
+    return out
 
 
 def _save_lsof_blocklist(blocked):
+    # `blocked` is {pid: first_blocked_ts}. Serialize one `pid:ts` per line.
     try:
         _LSOF_BLOCKLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _LSOF_BLOCKLIST_PATH.write_text("\n".join(sorted(blocked)))
+        lines = [f"{pid}:{ts:.0f}" for pid, ts in sorted(blocked.items())]
+        _LSOF_BLOCKLIST_PATH.write_text("\n".join(lines))
     except OSError:
         pass
 
@@ -1246,6 +1473,57 @@ def _lsof_cwd_for_pid(pid):
         if line.startswith("n/"):
             return line[1:]
     return None
+
+
+def _reap_orphan_claudes():
+    """Kill claude processes that aren't backed by a visible terminal window.
+
+    Two classes of orphan accumulate over time:
+      1. T-state (stopped) — someone ctrl-z'd a claude window, then closed the
+         terminal tab without `fg`'ing it. The shell parent died or the tab
+         vanished, but the stopped claude lingers indefinitely.
+      2. Children of terminal multiplexers (tmux, screen, dtach, byobu) —
+         e.g. `tmux new-session -d -s cc ... claude`. These can run detached
+         forever; the user-stated rule is "if the terminal isn't open I don't
+         need it."
+
+    Returns (killed_pids, errors) for the snapshot-only path to log if it
+    cares. Idempotent — re-running on a clean machine kills nothing.
+    """
+    try:
+        ps_out = subprocess.run(
+            ["ps", "-axo", "pid=,ppid=,stat=,comm="],
+            capture_output=True, text=True, timeout=3,
+        ).stdout
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return [], []
+
+    procs = {}
+    for line in ps_out.splitlines():
+        parts = line.strip().split(None, 3)
+        if len(parts) == 4:
+            procs[parts[0]] = (parts[1], parts[2], parts[3])
+
+    _MULTIPLEXER_PARENTS = {"tmux", "tmux:", "screen", "dtach", "byobu"}
+    to_kill = []  # (pid, reason, signal)
+    for pid, (ppid, stat, comm) in procs.items():
+        if comm != "claude":
+            continue
+        if "T" in stat:
+            to_kill.append((pid, "stopped", signal.SIGKILL))
+            continue
+        parent = procs.get(ppid)
+        if parent and parent[2] in _MULTIPLEXER_PARENTS:
+            to_kill.append((pid, f"detached-{parent[2]}", signal.SIGTERM))
+
+    killed, errors = [], []
+    for pid, reason, sig in to_kill:
+        try:
+            os.kill(int(pid), sig)
+            killed.append((pid, reason))
+        except (ProcessLookupError, PermissionError, OSError) as e:
+            errors.append((pid, reason, str(e)))
+    return killed, errors
 
 
 def _live_claude_project_dirs():
@@ -1285,22 +1563,43 @@ def _live_claude_project_dirs():
     """
     try:
         ps_out = subprocess.run(
-            ["ps", "-axo", "pid=,comm="],
+            ["ps", "-axo", "pid=,ppid=,stat=,comm="],
             capture_output=True, text=True, timeout=3,
         ).stdout
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         return {}
 
-    pids = []
+    # Index every process so we can look up a claude's parent COMM and skip
+    # ones whose visible window isn't actually visible.
+    all_procs = {}  # pid -> (ppid, stat, comm)
     for line in ps_out.splitlines():
-        parts = line.strip().split(None, 1)
-        if len(parts) == 2 and parts[1] == "claude":
-            pids.append(parts[0])
+        parts = line.strip().split(None, 3)
+        if len(parts) == 4:
+            all_procs[parts[0]] = (parts[1], parts[2], parts[3])
+
+    # Filters:
+    #  - T-state (stopped) — ctrl-z'd, no visible window, cwd still readable
+    #    so it would double-count under lsof.
+    #  - Parent is a terminal multiplexer (tmux/screen/dtach/byobu) — those
+    #    claudes can be detached and not attached to any visible window. The
+    #    user's "open windows" definition is visible terminals only.
+    _MULTIPLEXER_PARENTS = {"tmux", "tmux:", "screen", "dtach", "byobu"}
+    pids = []
+    for pid, (ppid, stat, comm) in all_procs.items():
+        if comm != "claude":
+            continue
+        if "T" in stat:
+            continue
+        parent = all_procs.get(ppid)
+        if parent and parent[2] in _MULTIPLEXER_PARENTS:
+            continue
+        pids.append(pid)
 
     if not pids:
-        _save_lsof_blocklist(set())
+        _save_lsof_blocklist({})
         return {}
 
+    import time
     blocked = _load_lsof_blocklist(set(pids))
     to_query = [p for p in pids if p not in blocked]
 
@@ -1310,9 +1609,10 @@ def _live_claude_project_dirs():
     if to_query:
         with ThreadPoolExecutor(max_workers=min(len(to_query), 8)) as pool:
             results = list(pool.map(_lsof_cwd_for_pid, to_query))
+        now = time.time()
         for pid, cwd in zip(to_query, results):
             if cwd is None:
-                blocked.add(pid)
+                blocked[pid] = now
                 continue
             encoded = cwd.replace("/", "-").replace("_", "-")
             dirs[encoded] = dirs.get(encoded, 0) + 1
@@ -1321,7 +1621,7 @@ def _live_claude_project_dirs():
     return dirs
 
 
-def live_session_stats(window_min=20, max_sessions=5, path_override=None):
+def live_session_stats(window_min=20, max_sessions=None, path_override=None):
     """Return a list of currently-active Claude Code sessions, worst→best.
 
     "Active" = a `claude` CLI process is running with its cwd = the JSONL's
@@ -1361,8 +1661,16 @@ def live_session_stats(window_min=20, max_sessions=5, path_override=None):
         return [stats]
 
     cutoff = now - window_min * 60
-    projects_dir = Path.home() / ".claude" / "projects"
-    if not projects_dir.exists():
+    # Scan BOTH account roots — primary (~/.claude/projects) and overflow
+    # (~/.claude-alt/projects). Each open Claude Code window writes only to
+    # its own root, so a single-root scan misses half of the user's live
+    # sessions when both accounts are in use.
+    project_roots = [
+        Path.home() / ".claude" / "projects",
+        Path.home() / ".claude-alt" / "projects",
+    ]
+    project_roots = [r for r in project_roots if r.exists()]
+    if not project_roots:
         return []
 
     live_project_counts = _live_claude_project_dirs()
@@ -1372,17 +1680,30 @@ def live_session_stats(window_min=20, max_sessions=5, path_override=None):
     # the same repo both get represented). If live_project_counts is empty
     # (ps/lsof failed), we skip this filter entirely and keep all mtime-fresh
     # JSONLs — same as the old behavior.
+    # When `live_project_counts` is populated, ps+lsof has already proven
+    # which windows are open. In that case the mtime cutoff is wrong — a
+    # freshly-opened terminal that hasn't typed anything yet still has a real
+    # live `claude` process, and we want it on the widget immediately. So we
+    # drop the cutoff for projects backed by a live process, and only apply
+    # it as a fallback when ps/lsof failed (live_project_counts empty).
+    # Bucket every candidate JSONL by project_dir across BOTH roots combined
+    # (not per root) — otherwise a project that happens to exist in both
+    # ~/.claude/projects/ and ~/.claude-alt/projects/ doubles up and we end up
+    # pulling 16-day-old transcripts to fill the per-root quota. Picking the
+    # N most-recent globally gives us the actual live window(s).
     by_project = {}
-    for f in projects_dir.glob("*/*.jsonl"):
-        if live_project_counts and f.parent.name not in live_project_counts:
-            continue  # ghost — no claude process has that cwd
-        try:
-            mt = f.stat().st_mtime
-        except OSError:
-            continue
-        if mt < cutoff:
-            continue
-        by_project.setdefault(f.parent.name, []).append((mt, f))
+    for root in project_roots:
+        for f in root.glob("*/*.jsonl"):
+            proj = f.parent.name
+            if live_project_counts and proj not in live_project_counts:
+                continue  # ghost — no claude process has that cwd
+            try:
+                mt = f.stat().st_mtime
+            except OSError:
+                continue
+            if not live_project_counts and mt < cutoff:
+                continue  # fallback path: no live signal, fall back to mtime
+            by_project.setdefault(proj, []).append((mt, f))
 
     candidates = []
     for proj, files in by_project.items():
@@ -1408,7 +1729,7 @@ def live_session_stats(window_min=20, max_sessions=5, path_override=None):
     # Sort: band severity first (crit at top), then highest bloat score.
     results.sort(key=lambda s: (_BAND_ORDER[s["band"]], -s["bloat_score"]))
 
-    return results[:max_sessions]
+    return results if max_sessions is None else results[:max_sessions]
 
 
 # Back-compat shim (kept in case anything else calls the old name).
@@ -1968,6 +2289,16 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET, account="primary
         }
 
     acct_cfg = ACCOUNTS.get(account, {})
+    # Anchor freshness: the widget extrapolates off the newest snapshot row.
+    # If the launchd poller has died (as on 2026-05-11 when a repo rename
+    # broke the plist path for 19 days), the anchor silently ages and the
+    # extrapolation piles a whole week of burn onto a stale calibration
+    # point — producing a confident, wrong number with no visible signal.
+    # Surface the anchor age so the JSX can dim + tag a stale reading
+    # WITHOUT painting a red error or freezing (per widget failure policy).
+    _extrap = data.get("_extrapolated") or {}
+    _anchor_age = _extrap.get("anchor_age_sec")
+    _stale = bool(_anchor_age is not None and _anchor_age > STALE_ANCHOR_SEC)
     return {
         "updated_at": datetime.now(timezone.utc).isoformat(),
         "updated_pt": datetime.now(timezone.utc).astimezone(PT).strftime("%-I:%M%p").lower(),
@@ -1975,12 +2306,15 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET, account="primary
         "account_id": account,
         "account_label": acct_cfg.get("label", account),
         "account_tier": acct_cfg.get("tier", "unknown"),
+        "anchor_age_sec": _anchor_age,
+        "stale": _stale,
         "session": session,
         "weekly": weekly,
         "weekly_sonnet": weekly_sonnet,
         "weekly_opus": weekly_opus,
         "today": today,
-        "live_sessions": live_session_stats(window_min=20, max_sessions=5),
+        "live_sessions": live_session_stats(window_min=20, max_sessions=None),
+        "contributors": _burn_contributors(conn, hours=24, account=account),
         "extra": extra_payload,
         "constraint": {
             "label": constraint_label,
@@ -2208,6 +2542,7 @@ def main():
 
         print(json.dumps({
             "accounts": accounts_payload,
+            "mac": _mac_health_snapshot(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "updated_pt": datetime.now(timezone.utc).astimezone(PT).strftime("%-I:%M%p").lower(),
         }))
@@ -2255,6 +2590,18 @@ def main():
                 )
             except (subprocess.SubprocessError, OSError) as e:
                 print(f"backfill failed (non-fatal): {e}", file=sys.stderr)
+        # Reap orphan claudes (stopped/detached with no visible window).
+        # Lives on the 15-min snapshot path, NOT the widget render path —
+        # destructive operations don't belong in a tick-every-few-seconds
+        # loop. Idempotent on a clean machine.
+        try:
+            killed, errors = _reap_orphan_claudes()
+            for pid, reason in killed:
+                print(f"reaped orphan claude pid={pid} ({reason})", file=sys.stderr)
+            for pid, reason, err in errors:
+                print(f"reap failed pid={pid} ({reason}): {err}", file=sys.stderr)
+        except Exception as e:
+            print(f"reap step failed (non-fatal): {e}", file=sys.stderr)
         # Exit non-zero if the API half failed so launchd's last-exit-status
         # still reflects real API health (that's what the user sees in
         # `launchctl list com.infrastructure.cc-usage.snapshot`).

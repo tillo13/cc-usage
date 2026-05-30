@@ -42,7 +42,7 @@ import sqlite3
 from pathlib import Path
 
 # Sibling data/ dir — keeps this repo self-contained so the widget stack can
-# live under _infrastructure/cc_usage/ with no absolute-path dependencies.
+# live under _local_infrastructure/cc_usage/ with no absolute-path dependencies.
 DB_PATH = Path(__file__).resolve().parent / "data" / "claude_usage.db"
 
 _SCHEMA = """

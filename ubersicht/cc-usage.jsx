@@ -61,15 +61,30 @@
 // widget invokes `${REPO_ROOT}/claude_code_usage.py --widget-json`.
 //
 const PYTHON_BIN = "/Users/at/Desktop/code/kicksaw/venv_kicksaw/bin/python3"
-const REPO_ROOT  = "/Users/at/Desktop/code/_infrastructure/cc_usage"
+const REPO_ROOT  = "/Users/at/Desktop/code/_local_infrastructure/cc_usage"
+
+// Übersicht 1.6 exposes `run(cmd)` via the `uebersicht` module — NOT as a
+// global. Importing here makes onClick handlers in the JSX able to fire
+// shell commands (e.g. the macBtn that launches smart_mac_cleaner).
+import { run } from "uebersicht"
 
 // Overflow account (claude2) renewal date. Set on 2026-04-15 when it was
-// upgraded Pro → Max 20x. Anthropic does not prorate downgrades, so the
-// only meaningful decision window is the ~2 weeks before this date — if
-// the prior month showed overflow rarely needed, downgrading back to Pro
-// saves $180/mo. The widget surfaces an amber nudge once we're inside
-// that window so the renewal doesn't auto-process unnoticed.
+// upgraded Pro → Max 20x. On 2026-04-26 the decision was made to downgrade
+// back to Pro — confirmed by one heavy week (57% of Max 20x, primary
+// capped) followed by two near-zero weeks (4% and 3%). claude2 stays Max
+// 20x through 2026-05-14, then auto-converts to Pro on 2026-05-15. Pro
+// covers a typical overflow week (~3–4% of Max 20x ≈ 60–80% of Pro) but
+// CANNOT cover a real cap week — if primary caps post-downgrade, bump
+// claude2 back to Max via Settings → Billing → Adjust plan. Stays as
+// warm spare otherwise.
+//
+// NOTE for future edits: tooltips below that say "Both accounts are Max
+// 20x" are correct only through 2026-05-14. After May 15, claude2 is
+// Pro ($20/mo, ~1/20 the weekly allotment) — capped-mode advice changes
+// (overflow exhausts in hours, not days) and the "$10k API-equivalent"
+// framing no longer applies.
 const OVERFLOW_RENEWAL_DATE = "2026-05-14"
+const OVERFLOW_DOWNGRADE_SCHEDULED = true   // → Pro on 2026-05-15
 const renewalDaysLeft = () => {
   const now = new Date()
   const renewal = new Date(OVERFLOW_RENEWAL_DATE + "T07:00:00Z") // approx midnight PT
@@ -274,11 +289,113 @@ export const className = `
   .bgWarn { background: #FFB800; }
   .bgCrit { background: #FFFFFF; }
 
+  /* Click-to-run mac cleaner button — in row 2 when load is bad. */
+  .macBtn {
+    cursor: pointer;
+    padding: 0 6px;
+    border-radius: 3px;
+    border: 1px solid currentColor;
+    transition: background 100ms ease;
+  }
+  .macBtn:hover { background: rgba(255, 184, 0, 0.18); }
+  .macBtn:active { background: rgba(255, 184, 0, 0.32); }
+
   /* Live-session inline wrapper — one per active session in the LIVE card. */
   .liveSess {
     display: inline-flex;
     align-items: center;
     gap: 2px;
+  }
+
+  /* ═══ WINDOWS STRIP — horizontal banner of active Claude Code windows ═══
+     Shows each live window's context fill against the 1M context beta, so
+     the user can eyeball "how close to the ceiling am I on each open
+     project" at a glance. Distinct from the row-2 LIVE card (which frames
+     sessions in terms of $/reply cost bands) — this one is purely a ceiling
+     meter. Sorted by fill %, worst-first. */
+  .winStrip {
+    border-bottom: 1px solid rgba(74, 227, 255, 0.10);
+    height: 20px;
+    padding: 0 18px;
+    gap: 14px;
+    overflow: hidden;
+  }
+  .winStripLbl {
+    font-size: 8.5px;
+    font-weight: 800;
+    letter-spacing: 0.22em;
+    text-transform: uppercase;
+    color: #4AE3FF;
+    line-height: 1;
+    font-variant-numeric: tabular-nums;
+    flex-shrink: 0;
+  }
+  .winStripLblDim { color: #5A6B82; font-weight: 600; }
+  .win {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-family: "SF Mono", ui-monospace, "JetBrains Mono", "Menlo", monospace;
+    font-size: 10px;
+    font-weight: 500;
+    color: #FFFFFF;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+    letter-spacing: -0.005em;
+  }
+  .winName {
+    color: #B8C8E0;
+    font-weight: 600;
+    max-width: 120px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .winBar {
+    display: inline-block;
+    position: relative;
+    width: 44px;
+    height: 6px;
+    background-color: rgba(184, 200, 224, 0.07);
+    background-image: linear-gradient(
+      to right,
+      transparent 0,
+      transparent calc(50% - 0.5px),
+      rgba(184, 200, 224, 0.26) calc(50% - 0.5px),
+      rgba(184, 200, 224, 0.26) calc(50% + 0.5px),
+      transparent calc(50% + 0.5px),
+      transparent 100%
+    );
+    border-top: 1px solid rgba(184, 200, 224, 0.28);
+    border-bottom: 1px solid rgba(184, 200, 224, 0.28);
+    flex-shrink: 0;
+    vertical-align: middle;
+  }
+  .winBarFill {
+    position: absolute;
+    top: 0; left: 0; bottom: 0;
+  }
+  .winK {
+    font-weight: 700;
+    color: #FFFFFF;
+  }
+  .winPct {
+    font-weight: 700;
+    font-size: 9.5px;
+  }
+  .winFlag {
+    font-size: 9px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    padding: 1px 4px 0 4px;
+    border: 1px solid currentColor;
+    line-height: 1;
+  }
+  .winRule {
+    width: 1px;
+    height: 10px;
+    background: rgba(184, 200, 224, 0.18);
+    flex-shrink: 0;
   }
 
   /* Pace pill — tiny text chip after each bar */
@@ -316,6 +433,20 @@ export const className = `
     width: 8px;
     background: rgba(74, 227, 255, 0.55);
   }
+  .contribStrip { margin-top: 2px; }
+  .contribBand {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 3px;
+    margin-left: 9px;
+    letter-spacing: 0.04em;
+  }
+  .contribLbl { font-size: 9px; opacity: 0.65; text-transform: uppercase; }
+  .contribPct { font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .contribDim  .contribPct { color: rgba(184, 200, 224, 0.55); }
+  .contribWarn .contribPct { color: #FFC857; }
+  .contribDom  .contribPct { color: #FF6B9D; text-decoration: underline; text-underline-offset: 2px; }
+  .contribDom  .contribLbl { opacity: 0.95; color: #FF6B9D; }
   .sparkBarToday {
     background: #4AE3FF;
     box-shadow: 0 0 0 1px #FFFFFF, 0 0 6px rgba(74, 227, 255, 0.8);
@@ -367,6 +498,21 @@ export const className = `
   @keyframes cc-pulse {
     0%, 100% { opacity: 1; transform: scale(1); }
     50%      { opacity: 0.35; transform: scale(0.72); }
+  }
+
+  /* ═══ stale anchor (snapshot poller dead/lagging) ═══
+     Subtle, never a red error splash and never a freeze (per widget failure
+     policy). The numbers still paint — they're just visibly de-trusted: the
+     primary clocks dim and the "updated" stamp becomes an amber "⟳ stale Nh"
+     tag. Catches the 2026-05-11 class of silent rot where the extrapolation
+     rode a 19-day-old calibration anchor and showed a confident, wrong %. */
+  .bar.stale .num { opacity: 0.4; }
+  .bar.stale .pulse { background: #E0A23C; box-shadow: 0 0 6px #E0A23C; animation: none; }
+  .updated.staleUpd { color: #E0A23C; }
+  .staleTag {
+    color: #E0A23C;
+    font-weight: 700;
+    letter-spacing: 0.03em;
   }
 
   /* ═══ claude2 migration nudge ═══
@@ -524,12 +670,31 @@ export const render = ({ output, error }) => {
   // When primary is capped (≥95%), the overflow becomes the daily driver
   // and gets promoted to the full instrument display. The capped primary
   // gets demoted to a compact "resets fri 6am → switch back" strip.
-  const primaryCapped = (primary.weekly || {}).used_pct >= 95
+  // Swap only if primary is truly capped AND there's >24h until reset.
+  // claude2 is a warm spare, not a daily driver — so when primary is at the
+  // threshold with hours left to reset, ride primary to ground instead of
+  // promoting an idle overflow card that reads as zeros.
+  const primaryWeekPct = (primary.weekly || {}).used_pct || 0
+  const primaryHoursLeft = (primary.weekly || {}).hours_left || 0
+  const primaryCapped = primaryWeekPct >= 99 && primaryHoursLeft > 24
   const hasOverflow = overflow && overflow.session
   const active = (primaryCapped && hasOverflow) ? overflow : primary
   const standby = (primaryCapped && hasOverflow) ? primary : overflow
   const activeLabel = active.account_label || "Max 20x"
   const standbyIsPrimary = primaryCapped && hasOverflow
+
+  // ── anchor staleness ──
+  // Python sets active.stale=true when the newest snapshot (the calibration
+  // anchor the extrapolation rides on) is older than 90 min — i.e. the
+  // launchd poller has likely died. We dim the numbers and swap the "updated"
+  // stamp for a "⟳ stale Nh" tag so a dead poller can't masquerade as a live
+  // reading (the 2026-05-11 silent-rot incident). NOT a red error, NOT a
+  // freeze — the numbers still render, just visibly de-trusted.
+  const activeStale = !!active.stale
+  const staleSec = active.anchor_age_sec || 0
+  const staleAgeLabel = staleSec >= 3600
+    ? Math.floor(staleSec / 3600) + "h"
+    : Math.max(1, Math.floor(staleSec / 60)) + "m"
 
   // ── claude2 migration nudge ──
   // Drives both the Row 1 pre-swap hint and the capped-strip urgent pulse.
@@ -607,8 +772,59 @@ export const render = ({ output, error }) => {
   const liveTop = liveSessions.slice(0, 3)        // inline display
   const worst = liveSessions[0] || null            // drives the headline pill
 
+  // ── windows strip (context fill of 1M context beta) ──
+  // Re-rank the active sessions by fill %, worst-first, and tag each one
+  // with a threshold class. These thresholds are tied to the 1M ceiling,
+  // not the 280k $/reply bands — two different questions, two different
+  // displays.
+  const CONTEXT_CAP = 1_000_000
+  const winSorted = liveSessions
+    .map((s) => {
+      const ctx = s.context_tokens || 0
+      const pct = (ctx / CONTEXT_CAP) * 100
+      // Tuned to cost-per-turn, not auto-compact. At ≥40% fill (400k ctx)
+      // cost-per-turn climbs noticeably; ≥65% (650k) is the last comfortable
+      // handoff window before things get expensive AND slow.
+      const cls = pct >= 65 ? "crit" : pct >= 40 ? "warn" : "good"
+      const flag = pct >= 65 ? "⚠ handoff" : null
+      return { ...s, _pct: pct, _cls: cls, _flag: flag }
+    })
+    .sort((a, b) => b._pct - a._pct)
+
   return (
-    <div className="bar">
+    <div className={"bar" + (activeStale ? " stale" : "")}>
+
+      {/* ════════════════════════════════════════════════════════════
+           ROW 0 — WINDOWS STRIP (context fill of 1M)
+           Horizontal list of every currently-active Claude Code window
+           with a mini fill bar against the 1M context ceiling. Tells the
+           user which window is about to hit auto-compact so they can
+           /handoff on their own terms instead of letting the summary do it.
+         ════════════════════════════════════════════════════════════ */}
+      {winSorted.length > 0 && (
+        <div className="row winStrip">
+          <span className="winStripLbl">
+            windows <span className="winStripLblDim">· ctx of 1M</span>
+          </span>
+          {winSorted.map((s, i) => (
+            <span key={s.session_id || i} className="win">
+              {i > 0 && <span className="winRule" />}
+              <span className="winName">{s.project || "?"}</span>
+              <span className="winBar">
+                <span
+                  className={"winBarFill " + (s._cls === "crit" ? "bgCrit" : s._cls === "warn" ? "bgWarn" : "bgGood")}
+                  style={{ width: Math.min(100, s._pct).toFixed(1) + "%" }}
+                />
+              </span>
+              <span className="winK">
+                {s.context_k != null ? (s.context_k >= 100 ? s.context_k.toFixed(0) : s.context_k.toFixed(1)) : "—"}k
+              </span>
+              <span className={"winPct " + s._cls}>{s._pct.toFixed(0)}%</span>
+              {s._flag && <span className={"winFlag " + s._cls}>{s._flag}</span>}
+            </span>
+          ))}
+        </div>
+      )}
 
       {/* ════════════════════════════════════════════════════════════
            ROW 1 — PRIMARY CLOCKS
@@ -616,13 +832,27 @@ export const render = ({ output, error }) => {
          ════════════════════════════════════════════════════════════ */}
       <div className="row">
 
-        {/* IDENTITY */}
+        {/* IDENTITY — leads with the $ gate, the constraint that actually binds
+            post-SpaceX (May 2026 limit increases made weekly quota non-scarce —
+            primary now projects ~19% on a hard week). The dollar overage cap is
+            the real ceiling now, so it gets top billing here; the WEEK quota card
+            to the right keeps the pacing detail. Falls back to the quota target
+            when there's no extra-usage payload (credits off / overflow active). */}
         <div className="card">
-          <span className="lbl lblDim">claude code{standbyIsPrimary ? " · pro" : ""}</span>
+          <span className="lbl lblDim">claude code{standbyIsPrimary && active.account_tier === "pro" ? " · pro" : ""}</span>
           <span className="val">
-            <span className="num">{target}</span>
-            <span className="unit">%</span>
-            <span className="hint">target</span>
+            {extra ? [
+              <span key="d" className="num">${extra.used_dollars.toFixed(0)}</span>,
+              <span key="sl" className="dot">/</span>,
+              <span key="cap" className="hint">${extra.cap_dollars.toFixed(0)}</span>,
+              <span key="mid" className="dot">·</span>,
+              <span key="pct" className={"num " + (extra.will_exhaust_before_reset ? "crit" : "")}>{extra.used_pct.toFixed(0)}</span>,
+              <span key="u" className="unit">%</span>,
+            ] : [
+              <span key="t" className="num">{target}</span>,
+              <span key="tu" className="unit">%</span>,
+              <span key="th" className="hint">target</span>,
+            ]}
           </span>
         </div>
 
@@ -786,9 +1016,11 @@ export const render = ({ output, error }) => {
           </div>
         </div>
 
-        <span className="updated">
+        <span className={"updated" + (activeStale ? " staleUpd" : "")}>
           <span className="pulse" />
-          <span>{d.updated_pt || primary.updated_pt || "—"}</span>
+          {activeStale
+            ? <span className="staleTag" title={"snapshot poller stale — last anchor " + staleAgeLabel + " ago; numbers extrapolated off an old calibration point"}>⟳ stale {staleAgeLabel}</span>
+            : <span>{d.updated_pt || primary.updated_pt || "—"}</span>}
         </span>
       </div>
 
@@ -1083,6 +1315,56 @@ export const render = ({ output, error }) => {
       </div>
 
       {/* ════════════════════════════════════════════════════════════
+           ROW 2.5 — BURN CONTRIBUTORS (last 24h)
+           Mirrors `claude /usage` "what's contributing" panel. Helps
+           decide when to /handoff (high ctx), close windows (parallel),
+           or cheaper-model the subagents (subagent-heavy).
+         ════════════════════════════════════════════════════════════ */}
+      {active.contributors && (() => {
+        const c = active.contributors
+        const bands = [
+          { key: "ctx",   lbl: "ctx>150k", pct: c.ctx_over_150k_pct, hint: "→ /handoff or /compact",       warn: 60 },
+          { key: "long",  lbl: "8h+ sess", pct: c.long_session_pct,  hint: "→ /handoff long sessions",     warn: 60 },
+          { key: "par",   lbl: "∥4+ par",  pct: c.parallel_pct,      hint: "→ close idle windows",         warn: 30 },
+          { key: "sub",   lbl: "subagent", pct: c.subagent_pct,      hint: "→ cheaper model for subagents", warn: 25 },
+        ]
+        const dominantPct = Math.max(...bands.map(b => b.pct))
+        return (
+          <div className="row row2 contribStrip">
+            <div className="card cardInline">
+              <span className="lbl">contrib · 24h</span>
+              {bands.map(b => {
+                const isDom = b.pct === dominantPct && b.pct > 0
+                const isWarn = b.pct >= b.warn
+                const cls = isDom ? "contribDom" : isWarn ? "contribWarn" : "contribDim"
+                return (
+                  <span key={b.key} className={"contribBand " + cls}>
+                    <span className="contribLbl">{b.lbl}</span>
+                    <span className="contribPct">{b.pct}%</span>
+                  </span>
+                )
+              })}
+              <div className="tip">
+                <span className="tipHead">what's burning your week (last 24h)</span>
+                {bands.map(b => [
+                  <span key={b.key + "k"} className="tipKey">{b.lbl} </span>,
+                  <span key={b.key + "v"} className="tipVal">{b.pct}%</span>,
+                  <span key={b.key + "h"} className="tipKey">  {b.hint}</span>,
+                  "\n",
+                ])}
+                <span className="tipNote">
+                  Cost-weighted share of last 24h burn. Bands aren't
+                  mutually exclusive — a session can be long AND parallel
+                  AND high-context all at once. The dominant band is the
+                  cheapest lever to pull first.
+                </span>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
+
+      {/* ════════════════════════════════════════════════════════════
            ROW 3 — STANDBY ACCOUNT (compact strip)
            Role-aware: shows whichever account is NOT driving Rows 1+2.
            Normal mode: standby = overflow, shows switch ETA.
@@ -1320,6 +1602,102 @@ export const render = ({ output, error }) => {
                 </span>
               </div>
             </div>
+
+            {d.mac && (() => {
+              const m = d.mac
+              const bandClass =
+                m.band === "crit" ? "crit"
+                : m.band === "warn" ? "warn"
+                : m.band === "elevated" ? "warn"
+                : "num"
+              const showButton = m.band === "warn" || m.band === "crit"
+              return (
+                <div className="card cardInline macCard">
+                  <span className="lbl">mac</span>
+                  <span className="val">
+                    <span className={bandClass}>load {m.load_1min != null ? m.load_1min.toFixed(1) : "?"}</span>
+                    {m.cores != null && (
+                      <span className="hint">/{m.cores}c</span>
+                    )}
+                    {(m.band === "elevated" || m.band === "warn" || m.band === "crit") && [
+                      <span key="hd" className="dot">·</span>,
+                      <span key="hh" className={m.hot_count >= 10 ? "warn" : "num"}>{m.hot_count} hot</span>,
+                    ]}
+                    {m.top_name && m.top_pct >= 50 && [
+                      <span key="td" className="dot">·</span>,
+                      <span key="tu" className="unit">top</span>,
+                      <span key="tv" className={
+                        m.top_pct >= 200 ? "crit"
+                        : m.top_pct >= 100 ? "warn"
+                        : "num"
+                      }>
+                        {String(m.top_name).slice(0, 14)} {m.top_pct.toFixed(0)}%
+                      </span>,
+                    ]}
+                    {m.ram_used_pct != null && [
+                      <span key="rd" className="dot">·</span>,
+                      <span key="ru" className="unit">ram</span>,
+                      <span key="rv" className={m.ram_used_pct >= 90 ? "warn" : "num"}>
+                        {m.ram_used_pct.toFixed(0)}%
+                      </span>,
+                    ]}
+                    {showButton && [
+                      <span key="cd" className="dot">·</span>,
+                      <span
+                        key="cb"
+                        className={"macBtn " + (m.band === "crit" ? "crit" : "warn")}
+                        onClick={() => {
+                          try {
+                            run("/Users/at/Desktop/code/_local_infrastructure/mac_cleaner/run_in_terminal.sh")
+                          } catch (e) { /* keep widget alive */ }
+                        }}
+                        title="Click to launch smart_mac_cleaner.py in a new Terminal tab"
+                      >
+                        ▶ run smart_mac_cleaner
+                      </span>,
+                    ]}
+                  </span>
+
+                  <div className="tip tipRight">
+                    <span className="tipHead">mac vitals · live</span>
+                    <span className="tipKey">load 1m   </span>
+                    <span className={"tipVal " + bandClass}>
+                      {m.load_1min != null ? m.load_1min.toFixed(2) : "—"}
+                    </span>
+                    <span className="tipKey">  / {m.cores} cores</span>{"\n"}
+                    <span className="tipKey">band      </span>
+                    <span className={"tipVal " + bandClass}>{m.band}</span>{"\n"}
+                    <span className="tipKey">hot procs </span>
+                    <span className={"tipVal " + (m.hot_count >= 10 ? "warn" : "")}>{m.hot_count}</span>
+                    <span className="tipKey">  (>10% CPU)</span>{"\n"}
+                    <span className="tipKey">ram       </span>
+                    <span className={"tipVal " + (m.ram_used_pct >= 90 ? "warn" : "")}>
+                      {m.ram_used_pct != null ? m.ram_used_pct.toFixed(0) + "%" : "—"}
+                    </span>
+                    {m.ram_used_gb != null && m.ram_total_gb != null && (
+                      <span className="tipKey">  ({m.ram_used_gb} / {m.ram_total_gb} GB)</span>
+                    )}{"\n\n"}
+                    <span className="tipKey">— top CPU processes —</span>{"\n"}
+                    {(m.top_procs || []).map((p, i) => [
+                      <span key={"pn" + i} className={
+                        p.pct >= 200 ? "tipVal crit"
+                        : p.pct >= 100 ? "tipVal warn"
+                        : "tipVal"
+                      }>
+                        {(i + 1) + ". " + p.name.padEnd(28)}
+                      </span>,
+                      <span key={"pp" + i} className="tipKey">{p.pct.toFixed(1) + "%"}</span>,
+                      "\n",
+                    ])}
+                    <span className="tipNote">
+                      load = work-queue depth (best signal). Above {m.cores} = busy,
+                      above {m.cores * 2} = sweating, above {m.cores * 4} = overwhelmed.
+                      {showButton ? "\n\nClick the ▶ button to fix." : ""}
+                    </span>
+                  </div>
+                </div>
+              )
+            })()}
           </div>
         )
       })()}
@@ -1327,34 +1705,67 @@ export const render = ({ output, error }) => {
       {(() => {
         const dLeft = renewalDaysLeft()
         if (dLeft > 14 || dLeft < -1) return null
-        const urgent = dLeft <= 7
+        const urgent = dLeft <= 3
         const colorClass = urgent ? "warn" : "hint"
+        const scheduled = OVERFLOW_DOWNGRADE_SCHEDULED
         return (
           <div className="row row2">
             <div className="card cardInline">
-              <span className={"lbl " + (urgent ? "warn" : "")}>claude2 renewal</span>
+              <span className={"lbl " + (urgent ? "warn" : "")}>
+                {scheduled ? "claude2 → pro" : "claude2 renewal"}
+              </span>
               <span className="val">
                 <span className={colorClass}>{dLeft <= 0 ? "today" : dLeft + "d"}</span>
                 <span className="dot">·</span>
-                <span className="unit">{OVERFLOW_RENEWAL_DATE}</span>
+                <span className="unit">2026-05-15</span>
                 <span className="dot">·</span>
-                <span className="hint">decide: keep Max 20x or downgrade?</span>
+                <span className="hint">
+                  {scheduled
+                    ? "downgrade scheduled · warm spare, bump to Max if primary caps"
+                    : "decide: keep Max 20x or downgrade?"}
+                </span>
               </span>
               <div className="tip">
-                <span className="tipHead">claude2 (overflow) auto-renews {OVERFLOW_RENEWAL_DATE}</span>
+                <span className="tipHead">
+                  {scheduled
+                    ? "claude2 (overflow) auto-converts to Pro on 2026-05-15"
+                    : "claude2 (overflow) auto-renews " + OVERFLOW_RENEWAL_DATE}
+                </span>
                 <span className="tipKey">days left  </span><span className={"tipVal " + colorClass}>{dLeft}</span>{"\n"}
-                <span className="tipKey">cost       </span><span className="tipVal">$200/mo (Max 20x)</span>{"\n"}
+                <span className="tipKey">now        </span><span className="tipVal">$200/mo (Max 20x)</span>{"\n"}
+                {scheduled && [
+                  <span key="a" className="tipKey">after      </span>,
+                  <span key="b" className="tipVal">$20/mo (Pro) · saves $180/mo</span>,
+                  "\n",
+                ]}
                 {"\n"}
-                <span className="tipVal warn">decide before renewal:</span>{"\n"}
-                <span className="tipKey">  • </span><span className="tipVal">keep Max 20x</span><span className="tipKey"> if cap-weeks are routine</span>{"\n"}
-                <span className="tipKey">  • </span><span className="tipVal">downgrade to Pro ($20)</span><span className="tipKey"> if rarely used — saves $180/mo</span>{"\n"}
-                <span className="tipKey">  • </span><span className="tipVal">downgrade to Max 5x ($100)</span><span className="tipKey"> as middle ground</span>{"\n"}
+                {scheduled ? [
+                  <span key="r1" className="tipVal">decision rationale:</span>, "\n",
+                  <span key="r2" className="tipKey">  • prior 3 weeks: 57% / 4% / 3% of Max 20x</span>, "\n",
+                  <span key="r3" className="tipKey">  • only 1 cap week out of 3 — overflow is</span>, "\n",
+                  <span key="r4" className="tipKey">    a fire extinguisher, not a second engine</span>, "\n",
+                  <span key="r5" className="tipKey">  • Pro covers a typical overflow week</span>, "\n",
+                  <span key="r6" className="tipKey">    (3–4% of Max 20x ≈ 60–80% of Pro)</span>, "\n",
+                  "\n",
+                  <span key="r7" className="tipVal warn">if primary caps post-downgrade:</span>, "\n",
+                  <span key="r8" className="tipKey">  Settings → Billing → Adjust plan → Max</span>, "\n",
+                  <span key="r9" className="tipKey">  Pro CANNOT cover a real cap week —</span>, "\n",
+                  <span key="rA" className="tipKey">  exhausts in hours of heavy Opus, not days</span>, "\n",
+                ] : [
+                  <span key="d1" className="tipVal warn">decide before renewal:</span>, "\n",
+                  <span key="d2" className="tipKey">  • </span>,
+                  <span key="d3" className="tipVal">keep Max 20x</span>,
+                  <span key="d4" className="tipKey"> if cap-weeks are routine</span>, "\n",
+                  <span key="d5" className="tipKey">  • </span>,
+                  <span key="d6" className="tipVal">downgrade to Pro ($20)</span>,
+                  <span key="d7" className="tipKey"> if rarely used — saves $180/mo</span>, "\n",
+                ]}
                 {"\n"}
                 <span className="tipNote">
-                  Anthropic does NOT prorate downgrades — they take effect
-                  at next renewal. So the decision window is BEFORE the
-                  renewal date. Check stats.py for actual cap frequency
-                  over the past month before deciding.
+                  Anthropic does NOT prorate downgrades — Max 20x stays
+                  active through {OVERFLOW_RENEWAL_DATE}, then Pro begins
+                  on the 15th. claude2 stays usable as overflow either
+                  way; the post-15 cap is just much smaller.
                 </span>
               </div>
             </div>

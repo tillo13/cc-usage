@@ -70,6 +70,19 @@ Built on [Übersicht](http://tracesof.net/ubersicht/). Two stacked bars
   intervention. The widget being "always visible" isn't a hope, it's
   an enforced invariant.
 
+#### Active windows banner (context fill of 1M)
+
+The topmost strip shows a horizontal list of every currently-active
+Claude Code window — one block per open project — with a mini fill bar
+against the 1M context ceiling (the `context-1m-2025-08-07` beta),
+sorted worst-first. At a glance you can see which open window is about
+to hit auto-compact so you can `/handoff` on your own terms instead of
+letting the lossy summary fire. Thresholds: neutral below 60% fill,
+amber at 60–80%, underlined white with a `⚠ HANDOFF` flag at 80%+. The
+scanner reads both `~/.claude/projects/` and `~/.claude-alt/projects/`,
+so windows open under either account of a multi-account setup all show
+up together.
+
 #### Weekly quota detail popover
 
 ![widget-weekly-detail](docs/screenshots/widget-weekly-detail.png)

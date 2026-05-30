@@ -128,6 +128,46 @@ This is intentional and documented in the code. Don't add error
 surfacing to the widget render path. If you think the widget should
 paint an error, you're wrong — extend the extrapolation instead.
 
+## Account tiers (post-SpaceX, as of 2026-05-30)
+
+Primary (`claude`) is **Max 20x**. Overflow (`claude2` / `~/.claude-alt`)
+**downgraded Max 20x → Pro on 2026-05-15, as scheduled** — the downgrade
+*executed* (confirmed 2026-05-30: 239 overflow turns hit 99% of the 5h
+session while 901 primary turns sat at ~4%, i.e. overflow's ceiling is
+~1/20th — Pro, not Max). The `ACCOUNTS` config in `claude_code_usage.py`
+now reflects this (`overflow` → `label: "Pro", tier: "pro"`); the API
+exposes no tier field, so that config is the source of truth.
+
+**The scarcity premise this tool was built on is largely gone.** On
+2026-05-06 Anthropic signed a SpaceX compute deal (300+ MW, 220k+ GPUs)
+and **doubled the 5-hour Claude Code limits + removed peak-hour
+throttling**; ~2026-05-13 they **raised weekly limits ~50%**. Net effect:
+**primary now rarely caps** — a genuinely hard week (15k+ turns, 4.7B raw
+tokens) projects to ~19% of the weekly limit, not 100%. See
+`memory/launchd-snapshot-path-fragility.md` and the deep-search trail in
+this session's history.
+
+Implications for code / doc / widget edits:
+
+- **The binding constraint is now dollars, not weekly quota.** Usage
+  credits are ON ($200/mo cap); overage is real money. The widget's Row 1
+  identity card leads with the `extra` $ gate for this reason. Weekly
+  quota pacing is now a near-dormant secondary.
+- **Overflow is a Pro warm spare** kept to preserve the OAuth token,
+  account state, and `claude2` shim — NOT a daily driver. Pro limits are
+  ~1/20th, so even light spare use maxes its 5h session (a 99% overflow
+  session is *expected*, not a bug). If primary ever actually caps, the
+  play is Settings → Billing → Adjust plan → Max on claude2, not "ride
+  out the week on Pro."
+- **Bridge mode + overflow-promotion are now almost always dormant** (see
+  below). Do NOT delete them — they're correctness-critical in the rare
+  cap event — but don't expect them to fire in normal operation.
+- Capped-mode tooltips referencing "Both accounts Max 20x" / "$10k
+  API-equivalent" are stale — overflow is Pro now.
+- `OVERFLOW_DOWNGRADE_SCHEDULED` in `ubersicht/cc-usage.jsx` stays `true`.
+  If claude2 is ever bumped back to Max, flip that constant AND the
+  `ACCOUNTS` overflow entry in `claude_code_usage.py` back together.
+
 ## Bridge mode (overflow weekly re-anchor)
 
 When primary is capped (≥95%) AND primary's reset is sooner than the
@@ -147,3 +187,30 @@ without killing the backfill half. The snapshot insert and the
 incremental backfill are independent: an API 429 storm (hours long,
 Retry-After: 0, no useful retry hint) must not freeze the turns
 table, because the turns table is what keeps the extrapolation alive.
+
+## Active windows banner (context fill of 1M)
+
+The widget's topmost row is a horizontal strip of every currently-active
+Claude Code window with a mini fill bar against the 1M context ceiling
+(the `context-1m-2025-08-07` beta). Purpose: give the user a single
+always-visible "which open window is about to compact" readout so they
+can `/handoff` on their own terms instead of letting auto-compact fire.
+
+Thresholds (1M-anchored, NOT the 280k $/reply bands used by the row-2
+LIVE card — two different questions). Tuned to cost-per-turn, not
+auto-compact: at >150k context you're already paying ~5× per turn vs
+fresh, so the bands are aggressive on purpose:
+  <40% fill   → neutral cyan
+  ≥40% fill   → amber (start thinking — cost-per-turn climbing)
+  ≥65% fill   → underlined white + "⚠ HANDOFF" flag (last comfortable
+                handoff window before turns get expensive AND slow)
+
+Data source is `live_session_stats()` in `claude_code_usage.py`, which
+MUST scan BOTH project roots — `~/.claude/projects/` (primary account)
+AND `~/.claude-alt/projects/` (overflow account) — because each open
+Claude Code window writes only to the root matching its active account.
+A single-root scan misses half the live windows when both accounts are
+in use. Do not "simplify" this back to a single root.
+
+Sessions are keyed by `(root_name, project_dir)` so the same project
+open under both accounts surfaces as two distinct windows.
