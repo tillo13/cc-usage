@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- cc-usage ROG mirror — rsync the ROG box's Claude Code transcripts to a
+     LOCAL dir every 15 min so the widget can ingest ROG windows without ever
+     touching the SMB mount on its render path. Install:
+       sed 's#__REPO_ROOT__#<abs repo path>#' \
+         launchd/com.cc-usage.rog-mirror.plist.template \
+         > ~/Library/LaunchAgents/com.cc-usage.rog-mirror.plist
+       launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.cc-usage.rog-mirror.plist -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.cc-usage.rog-mirror</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/at/Desktop/code/kicksaw/venv_kicksaw/bin/python3</string>
+        <string>__REPO_ROOT__/scripts/mirror_rog.py</string>
+    </array>
+    <key>StartInterval</key><integer>900</integer>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><false/>
+    <key>StandardOutPath</key><string>/tmp/cc_usage_rog_mirror.log</string>
+    <key>StandardErrorPath</key><string>/tmp/cc_usage_rog_mirror.log</string>
+    <key>ProcessType</key><string>Background</string>
+    <key>LowPriorityIO</key><true/>
+    <key>Nice</key><integer>10</integer>
+</dict>
+</plist>

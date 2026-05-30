@@ -1394,6 +1394,20 @@ def _scan_session_file(path):
     if turns == 0:
         return None
 
+    # Workflow / ultracode fan-out writes each subagent's transcript to a
+    # sibling dir <session>/subagents/workflows/wf_*/agent-*.jsonl — NOT into
+    # the main transcript. Counting those files is the authoritative fan-out
+    # width and works for mac AND the rog mirror; the in-file agentType count
+    # above is a fallback for sessions whose orchestration is inline.
+    try:
+        subdir = path.parent / path.stem / "subagents"
+        if subdir.is_dir():
+            sub_files = list(subdir.glob("workflows/*/agent-*.jsonl"))
+            if sub_files:
+                agent_turns = max(agent_turns, len(sub_files))
+    except OSError:
+        pass
+
     return {
         "session_id": session_id or path.stem,
         "project": _short_project_label(project_cwd),
@@ -1679,13 +1693,20 @@ def live_session_stats(window_min=20, max_sessions=None, path_override=None):
     # (~/.claude-alt/projects). Each open Claude Code window writes only to
     # its own root, so a single-root scan misses half of the user's live
     # sessions when both accounts are in use.
+    # (root, host) — host "mac" gets ps/lsof liveness; host "rog" is the local
+    # mirror of the ROG box's transcripts (rsync'd by scripts/mirror_rog_claude.sh).
+    # We can't ps a remote box, so ROG sessions use mtime-only liveness with a
+    # wider cutoff to absorb the 15-min mirror lag. Reading the local mirror —
+    # never the SMB mount — keeps the widget render path stall-proof.
     project_roots = [
-        Path.home() / ".claude" / "projects",
-        Path.home() / ".claude-alt" / "projects",
+        (Path.home() / ".claude" / "projects", "mac"),
+        (Path.home() / ".claude-alt" / "projects", "mac"),
+        (Path.home() / ".claude-rog" / "projects", "rog"),
     ]
-    project_roots = [r for r in project_roots if r.exists()]
+    project_roots = [(r, h) for r, h in project_roots if r.exists()]
     if not project_roots:
         return []
+    rog_cutoff = now - max(window_min, 25) * 60   # mirror lag (~15m) + a little slack
 
     live_project_counts = _live_claude_project_dirs()
 
@@ -1706,33 +1727,48 @@ def live_session_stats(window_min=20, max_sessions=None, path_override=None):
     # pulling 16-day-old transcripts to fill the per-root quota. Picking the
     # N most-recent globally gives us the actual live window(s).
     by_project = {}
-    for root in project_roots:
+    for root, host in project_roots:
         for f in root.glob("*/*.jsonl"):
             proj = f.parent.name
-            if live_project_counts and proj not in live_project_counts:
-                continue  # ghost — no claude process has that cwd
             try:
                 mt = f.stat().st_mtime
             except OSError:
                 continue
-            if not live_project_counts and mt < cutoff:
-                continue  # fallback path: no live signal, fall back to mtime
-            by_project.setdefault(proj, []).append((mt, f))
+            if host == "rog":
+                # Remote box — can't ps it. Pure mtime liveness, wider cutoff.
+                if mt < rog_cutoff:
+                    continue
+            else:
+                if live_project_counts and proj not in live_project_counts:
+                    continue  # ghost — no claude process has that cwd
+                if not live_project_counts and mt < cutoff:
+                    continue  # fallback path: no live signal, fall back to mtime
+            by_project.setdefault((host, proj), []).append((mt, f, host))
 
     candidates = []
-    for proj, files in by_project.items():
+    for (host, proj), files in by_project.items():
         files.sort(key=lambda x: -x[0])  # newest mtime first
-        keep = live_project_counts.get(proj, len(files)) if live_project_counts else len(files)
+        if host == "rog":
+            keep = len(files)  # no ps signal; mtime cutoff already pruned
+        else:
+            keep = live_project_counts.get(proj, len(files)) if live_project_counts else len(files)
         candidates.extend(files[:keep])
 
     if not candidates:
         return []
 
     results = []
-    for mtime, path in candidates:
+    for mtime, path, host in candidates:
         stats = _scan_session_file(path)
         if not stats:
             continue
+        if host == "rog":
+            # Label ROG windows distinctly: "ROG/<last path segment>". The cwd
+            # is a Windows path (C:\local\dos_bros) — take the trailing segment.
+            cwd = (stats.get("project_cwd") or "").replace("/", "\\").rstrip("\\")
+            seg = cwd.split("\\")[-1] if cwd else (stats.get("project") or "rog")
+            stats["host"] = "rog"
+            stats["project"] = "ROG/" + (seg or "rog")
         band, word = _classify_session(stats["turns"], stats.get("context_k"))
         stats["band"] = band
         stats["status_word"] = word
