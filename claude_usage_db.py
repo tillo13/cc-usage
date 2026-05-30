@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS turns (
     service_tier                    TEXT,
     is_sidechain                    INTEGER,               -- 0/1
     agent_type                      TEXT,                  -- subagent/workflow agentType (NULL on normal turns)
+    host                            TEXT,                  -- "mac" | "rog" — which machine produced the turn
     cc_version                      TEXT,                  -- Claude Code version string
     source_file                     TEXT                   -- jsonl path (for auditing)
 );
@@ -195,6 +196,10 @@ _MIGRATIONS = [
     # agentType on subagent/workflow turns (Explore, general-purpose, …) —
     # the signature of ultracode / dynamic-workflow fan-out. NULL on normal turns.
     ("turns",     "agent_type",       "TEXT"),
+    # Which machine produced the turn. Mac turns (~/.claude, ~/.claude-alt) =
+    # "mac"; ROG turns (mirrored from the Windows box) = "rog". Same account,
+    # so it doesn't affect quota math — purely a stats dimension.
+    ("turns",     "host",             "TEXT"),
 ]
 
 

@@ -39,18 +39,19 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_usage_db as dbmod  # noqa: E402
 
-# Per-account glob sets.  Each account's JSONL files live under its own
-# CLAUDE_CONFIG_DIR — primary at ~/.claude, overflow at ~/.claude-alt.
-ACCOUNT_GLOBS = {
-    "primary": [
-        os.path.expanduser("~/.claude/projects/*/*.jsonl"),
-        os.path.expanduser("~/.claude/sessions/*.jsonl"),
-    ],
-    "overflow": [
-        os.path.expanduser("~/.claude-alt/projects/*/*.jsonl"),
-        os.path.expanduser("~/.claude-alt/sessions/*.jsonl"),
-    ],
-}
+# (account, host, glob). account drives quota math; host is a stats-only
+# dimension for the machine. Mac transcripts live under each account's
+# CLAUDE_CONFIG_DIR (primary ~/.claude, overflow ~/.claude-alt). ROG transcripts
+# are rsync'd to the local mirror ~/.claude-rog by scripts/mirror_rog.py and
+# share the PRIMARY account server-side, so they're tagged account=primary /
+# host=rog — counted toward primary's quota, distinguishable in stats.
+ACCOUNT_GLOBS = [
+    ("primary",  "mac", os.path.expanduser("~/.claude/projects/*/*.jsonl")),
+    ("primary",  "mac", os.path.expanduser("~/.claude/sessions/*.jsonl")),
+    ("overflow", "mac", os.path.expanduser("~/.claude-alt/projects/*/*.jsonl")),
+    ("overflow", "mac", os.path.expanduser("~/.claude-alt/sessions/*.jsonl")),
+    ("primary",  "rog", os.path.expanduser("~/.claude-rog/projects/*/*.jsonl")),
+]
 
 # Trim tool_use input payloads to this size before storing. Keeps DB small
 # while still preserving enough to answer "what did I Grep for most often"
@@ -74,16 +75,15 @@ def _parse_since(arg):
 
 
 def _files_to_scan(since_seconds):
-    """Return list of (path, account) tuples across all configured accounts."""
+    """Return list of (path, account, host) tuples across all sources."""
     results = []
-    for account, globs in ACCOUNT_GLOBS.items():
-        for pattern in globs:
-            for f in sorted(glob.glob(pattern)):
-                results.append((f, account))
+    for account, host, pattern in ACCOUNT_GLOBS:
+        for f in sorted(glob.glob(pattern)):
+            results.append((f, account, host))
     if since_seconds is None:
         return results
     cutoff = time.time() - since_seconds
-    return [(f, acct) for f, acct in results if os.path.getmtime(f) >= cutoff]
+    return [(f, a, h) for f, a, h in results if os.path.getmtime(f) >= cutoff]
 
 
 def _content_stats(blocks):
@@ -167,7 +167,7 @@ def _int_or_zero(v):
 # per-entry extractors — each returns a list of (table, row) inserts
 # ------------------------------------------------------------------
 
-def _extract_assistant(entry, source_file, account="primary"):
+def _extract_assistant(entry, source_file, account="primary", host="mac"):
     """Return list of (table, row) pairs for one assistant entry."""
     msg = entry.get("message") or {}
     usage = msg.get("usage") or {}
@@ -202,6 +202,7 @@ def _extract_assistant(entry, source_file, account="primary"):
         "service_tier":                usage.get("service_tier"),
         "is_sidechain":                1 if entry.get("isSidechain") else 0,
         "agent_type":                  entry.get("agentType"),
+        "host":                        host,
         "cc_version":                  entry.get("version"),
         "source_file":                 source_file,
         "account":                     account,
@@ -316,9 +317,15 @@ def _extract_user(entry, source_file):
 
 
 def _extract_event(entry, source_file):
-    """Catchall: system, permission-mode, attachment, file-history-snapshot,
-    queue-operation, last-prompt, etc."""
+    """Store ONLY `system` events. turn_duration (a system subtype) feeds
+    turns.duration_ms, and that join is the ONLY thing the whole codebase reads
+    from this table. Everything else — progress, file-history-snapshot,
+    queue-operation, attachment, last-prompt, etc. — is write-only cruft that
+    ballooned the DB to 11 GB (~95% of 8.8M rows), so we no longer ingest it.
+    The data is regenerable from the JSONL on any future backfill if ever needed."""
     t = entry.get("type")
+    if t != "system":
+        return []
     subtype = entry.get("subtype")
     # Hoist duration_ms for system.turn_duration specifically
     duration_ms = entry.get("durationMs")
@@ -340,10 +347,10 @@ def _extract_event(entry, source_file):
     })]
 
 
-def _dispatch(entry, source_file, account="primary"):
+def _dispatch(entry, source_file, account="primary", host="mac"):
     t = entry.get("type")
     if t == "assistant":
-        return _extract_assistant(entry, source_file, account=account)
+        return _extract_assistant(entry, source_file, account=account, host=host)
     if t == "user":
         return _extract_user(entry, source_file)
     return _extract_event(entry, source_file)
@@ -381,7 +388,7 @@ def backfill(since=None, verbose=True):
     rows_in_txn = 0
     conn.execute("BEGIN")
 
-    for i, (path, account) in enumerate(files, 1):
+    for i, (path, account, host) in enumerate(files, 1):
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
@@ -393,7 +400,7 @@ def backfill(since=None, verbose=True):
                     except json.JSONDecodeError:
                         continue
                     counts["entries"] += 1
-                    rows = _dispatch(entry, path, account=account)
+                    rows = _dispatch(entry, path, account=account, host=host)
                     for table, row in rows:
                         counts[table] += 1
                         before = conn.total_changes
