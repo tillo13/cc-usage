@@ -51,15 +51,38 @@ A self-contained stack that
   any crash / Cmd-Q / forced kill. Non-negotiable for the widget to
   qualify as "always-visible." Uses `KeepAlive=true`,
   `ThrottleInterval=10`, `ProcessType=Interactive`.
+- `launchd/com.cc-usage.rog-mirror.plist.template` — launchd agent
+  (15-min) that runs `scripts/mirror_rog.py`. See "ROG ingestion" below.
+- `scripts/mirror_rog.py` — rsyncs the ROG (Windows) box's Claude Code
+  transcripts to a LOCAL mirror so the widget can ingest ROG windows
+  without ever touching the SMB mount on the render path. Network-aware
+  self-heal (see "ROG ingestion").
+- `scripts/jsxcheck.js` — validates `ubersicht/cc-usage.jsx` by
+  transpiling it with Übersicht's OWN bundled `@babel/preset-react`.
+  **ALWAYS run before installing a widget edit** — the widget is
+  load-bearing and a JSX syntax error red-splashes it:
+  `node scripts/jsxcheck.js ubersicht/cc-usage.jsx` (use the nvm node:
+  `~/.nvm/versions/node/*/bin/node`). This is the only thing standing
+  between a bad edit and a broken always-visible widget.
 
 ## Wiring (user-installed, not tracked in repo)
 
 | Consumer | Path |
 |---|---|
 | Shell alias `cc-usage` | `~/.zshrc` (one line — `alias cc-usage="<python> <repo>/claude_code_usage.py"`) |
-| launchd 15-min snapshot | `~/Library/LaunchAgents/com.cc-usage.snapshot.plist` |
+| launchd 15-min snapshot | `~/Library/LaunchAgents/com.infrastructure.cc-usage.snapshot.plist` (note: the *installed* label is `com.infrastructure.cc-usage.snapshot`, not the repo template's `com.cc-usage.snapshot`) |
 | launchd Übersicht watchdog | `~/Library/LaunchAgents/com.ubersicht.keepalive.plist` |
+| launchd 15-min ROG mirror | `~/Library/LaunchAgents/com.cc-usage.rog-mirror.plist` |
 | Übersicht widget | `~/Library/Application Support/Übersicht/widgets/cc-usage.jsx` |
+
+**launchd plist gotchas (both bit us 2026-05-30):** (1) absolute paths —
+if the repo dir moves, all plists break silently (snapshotter was dead
+19 days from the `_infrastructure`→`_local_infrastructure` rename). (2)
+XML comments cannot contain `--` (double-hyphen); launchd's lenient
+parser accepts it but strict parsers reject it, and a careless sed to
+"fix" it clobbered the real `--snapshot-only`/`--source` args → argparse
+exit 2. Always `plutil -lint` or `python3 -c "import plistlib;
+plistlib.load(...)"` after editing a plist.
 
 All three reference absolute paths chosen by the user at install time.
 If the repo is moved, all three must be updated.
@@ -97,6 +120,16 @@ var (any IANA zone name). Default is `America/Los_Angeles`.
   free.
 - Schema migrations are forward-only via `PRAGMA table_info` + in-place
   `ALTER TABLE ADD COLUMN` — safe to call against a stale DB.
+- **Only `type='system'` events are ingested.** `_extract_event` stores
+  system events only (`turn_duration` feeds `turns.duration_ms` — the
+  ONLY thing the codebase reads from the `events` table). `progress` /
+  `file-history-snapshot` / `queue-operation` / `attachment` etc. were
+  ~95% of 8.8M rows and write-only — they ballooned the DB to **11 GB**
+  (2026-05-30). Pruned + VACUUMed to 0.57 GB; do NOT re-enable ingesting
+  non-system events, and if `events` ever bloats again, prune with
+  `DELETE FROM events WHERE type != 'system'` + `VACUUM` (needs ~DB-size
+  free disk; disable the snapshot launchd agent first to avoid a
+  write-lock collision).
 
 ## Widget failure policy
 
@@ -214,3 +247,56 @@ in use. Do not "simplify" this back to a single root.
 
 Sessions are keyed by `(root_name, project_dir)` so the same project
 open under both accounts surfaces as two distinct windows.
+
+`live_session_stats()` ALSO scans a third root — `~/.claude-rog/projects/`
+(the ROG mirror, see below) — tagged `host="rog"` and labeled
+`ROG/<dir>`. ROG sessions use mtime-only liveness (can't `ps` a remote
+box) with a wider 25-min cutoff for mirror lag.
+
+## ROG ingestion (Windows box folded into cc-usage)
+
+Andy also runs Claude Code on the ROG (Windows, `10.0.0.138`, same
+account as Mac primary → its quota burn already counts server-side). To
+surface ROG windows + stats without double-counting:
+
+- `scripts/mirror_rog.py` (launchd `com.cc-usage.rog-mirror`, 15-min)
+  rsyncs the ROG's `~/.claude/projects/*.jsonl` (via the SMB mount at
+  `/tmp/rog_c`) to a LOCAL mirror `~/.claude-rog/projects/`. **The widget
+  reads ONLY the local mirror, never the SMB mount** — a wedged remote
+  mount must never freeze the render path.
+- **Network-aware self-heal:** if the mount has fallen off, the mirror
+  probes the ROG's SMB port on the *current* network. Reachable (same
+  LAN) → `mount_smbfs` remount + sync (creds from the canonical
+  `rog_gateway/.env`). Unreachable (laptop away) → skip silently, no
+  hang. So leaving + returning to the ROG's network reconnects on its
+  own within one 15-min cycle. (Runs via the FDA venv python — launchd
+  `/bin/bash` is TCC-blocked from `~/Desktop`; `mount_smbfs` is `/sbin`.)
+- **Backfill** tags ROG turns `account=primary` (correct quota math) +
+  `host=rog` (the new `turns.host` column) for stats splits. ROG turns
+  fold into the primary extrapolation base since they share the quota.
+
+## Widget instrument changes (post-SpaceX, 2026-05-30)
+
+After the May SpaceX limit increases, weekly quota stopped binding for a
+16h/day user (~26% normal, ~50% crunch — top half of Max 20x is
+unreachable). The widget was re-pointed from "don't blow the cap" to
+"use the $200 plan":
+
+- **Utilization gauge** (WEEK card): `used% · cold|warm|on-target|hot · N× room`.
+  `headroom_x = target / projected_pct` = how much harder you could run
+  and still just hit 99% (pace- + time-of-day-aware via projected_pct).
+  COLD = under-using; HOT = projected past target → overage ($) risk.
+- **WEEKS trend** (row 2, next to DAYS): 8-week cost-weighted burn
+  sparkline + a "typical/hot/light" heat word vs the median of prior
+  weeks. Burn (not %) because % isn't comparable across the limit change.
+- **Per-window cost + agents badge** (WINDOWS strip): `$X/r` per window
+  and `⚙ N` when a window is running workflow/ultracode fan-out. Fan-out
+  is detected via the `<session>/subagents/workflows/*/agent-*.jsonl`
+  sibling dir — NOT in-file `isSidechain` (which stays false; subagent
+  turns aren't in the main transcript). The effort *setting* (ultracode)
+  is never written to the JSONL, so only the *activity* is observable.
+- **Row 1 leads with the `$` overage gate** (the real ceiling now), not
+  the obsolete 99% quota target. SAFE PACE + duplicate EXTRA card removed.
+
+See "Account tiers" above for the why; `memory/lean-into-main-account.md`
+and `memory/utilization-goal.md` for Andy's standing intent.
