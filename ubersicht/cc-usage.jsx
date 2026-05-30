@@ -848,6 +848,8 @@ export const render = ({ output, error }) => {
               <span key="mid" className="dot">·</span>,
               <span key="pct" className={"num " + (extra.will_exhaust_before_reset ? "crit" : "")}>{extra.used_pct.toFixed(0)}</span>,
               <span key="u" className="unit">%</span>,
+              extra.cap_hit_label && <span key="cd" className="dot">→</span>,
+              extra.cap_hit_label && <span key="cl" className={extra.will_exhaust_before_reset ? "crit" : "hint"}>cap {extra.cap_hit_label.split(",")[0]}</span>,
             ] : [
               <span key="t" className="num">{target}</span>,
               <span key="tu" className="unit">%</span>,
@@ -922,20 +924,9 @@ export const render = ({ output, error }) => {
               )}
             </span>
             <span className={paceClass(weekDelta)}>{weekQuotaPct.toFixed(0)}%</span>
-            {vsIdeal != null && [
-              <span key="vd" className="dot">·</span>,
-              <span key="vv" className={paceClass(vsIdeal)}>
-                {vsIdeal >= 0 ? "+" : ""}{vsIdeal.toFixed(2)}
-              </span>,
-              <span key="vu" className="unit">vs ideal</span>,
-            ]}
-            {projectedPct != null && [
-              <span key="pd" className="dot">→</span>,
-              <span key="pv" className={projClass}>
-                {projectedPct.toFixed(0)}%
-              </span>,
-              <span key="pu" className="unit">proj</span>,
-            ]}
+            {/* vs-ideal + projection demoted post-SpaceX — weekly quota no longer
+               binds (projects ~19% on a hard week), so the pacing noise is gone
+               from the visible row. Full detail still lives in the tooltip below. */}
             {bridge && [
               <span key="bd" className="dot">·</span>,
               <span key="bl" className="unit">7d</span>,
@@ -1149,59 +1140,6 @@ export const render = ({ output, error }) => {
           <span key="lvr" className="rule" />,
         ]}
 
-        {/* SAFE PACE — the forecast instrument */}
-        <div className="card cardInline">
-          <span className="lbl">safe pace</span>
-          <span className="val">
-            {safeHours != null ? [
-              <span key="sh" className="num good">{safeHours.toFixed(1)}</span>,
-              <span key="sg" className="unit">h/active day</span>,
-              daysLeft != null && <span key="sd" className="dot">×</span>,
-              daysLeft != null && <span key="sn" className="num">{daysLeft.toFixed(1)}</span>,
-              daysLeft != null && <span key="su" className="unit">d</span>,
-              <span key="sa" className="dot">→</span>,
-              <span key="sp" className="hint">{target}% lands</span>,
-            ] : (
-              <span className="hint">accumulating…</span>
-            )}
-            {rate != null && [
-              <span key="r1" className="dot">·</span>,
-              <span key="r2" className="unit">burn</span>,
-              <span key="r3" className="num">{rate.toFixed(2)}</span>,
-              <span key="r4" className="unit">%/hr</span>,
-            ]}
-          </span>
-
-          <div className="tip">
-            <span className="tipHead">safe pace forecast</span>
-            {safeHours != null ? [
-              <span key="a1" className="tipKey">daily budget </span>,
-              <span key="a2" className="tipVal good">{safeHours.toFixed(1)}h</span>,
-              <span key="a3" className="tipKey"> active time per day</span>,
-              "\n",
-              <span key="a4" className="tipKey">for          </span>,
-              <span key="a5" className="tipVal">{daysLeft ? daysLeft.toFixed(1) : "?"} days</span>,
-              "\n",
-              <span key="a6" className="tipKey">lands at     </span>,
-              <span key="a7" className="tipVal">{target}% by weekly reset</span>,
-              "\n",
-            ] : <span className="tipKey">Need more active hours to compute forecast.{"\n"}</span>}
-            {rate != null && [
-              <span key="b1" className="tipKey">current rate </span>,
-              <span key="b2" className="tipVal">{rate.toFixed(2)}% quota/active hour</span>,
-              "\n",
-            ]}
-            <span className="tipNote">
-              "Active hour" = a distinct hour where you actually sent at
-              least one message. Idle time doesn't count — so 4h/day means
-              4 hours of real typing, not 4 hours of wall-clock presence.
-              One heavy day front-loads the rate calc; it smooths as the
-              week progresses.
-            </span>
-          </div>
-        </div>
-
-        <span className="rule" />
 
         {/* TODAY — retrospective */}
         <div className="card cardInline">
@@ -1239,78 +1177,6 @@ export const render = ({ output, error }) => {
           </div>
         </div>
 
-        {/* EXTRA — pay-as-you-go dollar budget (monthly cap) */}
-        {extra && [
-          <span key="xr" className="rule" />,
-          <div key="xc" className="card cardInline">
-            <span className="lbl">extra $</span>
-            <span className="val">
-              <span className="num">${extra.used_dollars.toFixed(0)}</span>
-              <span className="dot">/</span>
-              <span className="hint">${extra.cap_dollars.toFixed(0)}</span>
-              <span className="dot">·</span>
-              <span className="num">{extra.used_pct.toFixed(0)}</span>
-              <span className="unit">%</span>
-              {extra.cap_hit_label ? [
-                <span key="ce" className="dot">→</span>,
-                <span key="ch" className={"num " + (extra.will_exhaust_before_reset ? "crit" : "warn")}>
-                  cap {extra.cap_hit_label}
-                </span>,
-              ] : extra.pace_dollars_per_day === 0 ? [
-                <span key="cs" className="dot">·</span>,
-                <span key="ct" className="hint">stable</span>,
-              ] : [
-                <span key="cs" className="dot">·</span>,
-                <span key="ct" className="hint">tracking…</span>,
-              ]}
-            </span>
-
-            <div className="tip tipRight">
-              <span className="tipHead">extra $ budget · monthly cap</span>
-              <span className="tipKey">used      </span><span className="tipVal">${extra.used_dollars.toFixed(2)}</span>{"\n"}
-              <span className="tipKey">remaining </span><span className="tipVal">${extra.remaining_dollars != null ? extra.remaining_dollars.toFixed(2) : (extra.cap_dollars - extra.used_dollars).toFixed(2)}</span>{"\n"}
-              <span className="tipKey">cap       </span><span className="tipVal">${extra.cap_dollars.toFixed(2)}</span>{"\n"}
-              <span className="tipKey">burn      </span><span className="tipVal">{extra.used_pct.toFixed(1)}% of monthly cap</span>{"\n"}
-              {"\n"}
-              {extra.pace_dollars_per_day != null ? [
-                <span key="r1" className="tipKey">rate      </span>,
-                <span key="r2" className="tipVal">${extra.pace_dollars_per_day.toFixed(2)}/day</span>,
-                <span key="r3" className="tipKey">  over last {extra.pace_lookback_hours ? (extra.pace_lookback_hours < 48 ? extra.pace_lookback_hours.toFixed(0) + "h" : (extra.pace_lookback_hours / 24).toFixed(1) + "d") : "?"}</span>,
-                "\n",
-              ] : [
-                <span key="r1" className="tipKey">rate      </span>,
-                <span key="r2" className="tipVal">— (need more snapshot history)</span>,
-                "\n",
-              ]}
-              {extra.cap_hit_label ? [
-                <span key="c1" className="tipKey">cap hit   </span>,
-                <span key="c2" className={"tipVal " + (extra.will_exhaust_before_reset ? "crit" : "warn")}>
-                  {extra.cap_hit_label}
-                </span>,
-                <span key="c3" className="tipKey">  ({extra.days_until_cap != null ? extra.days_until_cap.toFixed(1) : "?"} days from now)</span>,
-                "\n",
-              ] : extra.pace_dollars_per_day === 0 ? [
-                <span key="c1" className="tipKey">cap hit   </span>,
-                <span key="c2" className="tipVal good">not projected</span>,
-                <span key="c3" className="tipKey">  (counter stable, no recent overage)</span>,
-                "\n",
-              ] : [
-                <span key="c1" className="tipKey">cap hit   </span>,
-                <span key="c2" className="tipVal">tracking…</span>,
-                <span key="c3" className="tipKey">  (waiting for counter to move)</span>,
-                "\n",
-              ]}
-              <span className="tipNote">
-                Monthly pay-as-you-go budget. The counter accrues when
-                weekly Opus usage exceeds 100% of your plan allowance. The
-                rate is computed from local snapshot history (15-min
-                cadence), since the Anthropic API doesn't expose a reset
-                date for this field.
-                {extra.will_exhaust_before_reset && "\n\n⚠ PROJECTED TO HIT CAP BEFORE MONTH END at current pace."}
-              </span>
-            </div>
-          </div>,
-        ]}
 
       </div>
 
@@ -1327,7 +1193,7 @@ export const render = ({ output, error }) => {
           { key: "long",  lbl: "8h+ sess", pct: c.long_session_pct,  hint: "→ /handoff long sessions",     warn: 60 },
           { key: "par",   lbl: "∥4+ par",  pct: c.parallel_pct,      hint: "→ close idle windows",         warn: 30 },
           { key: "sub",   lbl: "subagent", pct: c.subagent_pct,      hint: "→ cheaper model for subagents", warn: 25 },
-        ]
+        ].filter(b => b.key === "ctx" || b.pct > 0)   // keep ctx always (the real lever); drop 0% noise
         const dominantPct = Math.max(...bands.map(b => b.pct))
         return (
           <div className="row row2 contribStrip">
@@ -1537,70 +1403,20 @@ export const render = ({ output, error }) => {
           : "good"
         return (
           <div className="row row2">
+            {/* overflow collapsed to a dim one-liner — post-SpaceX it's a Pro
+               emergency spare, not a daily driver (see CLAUDE.md account-tiers).
+               The capped-mode bridge branch above is intentionally untouched. */}
             <div className="card cardInline">
-              <span className="lbl">{stbLabel.toLowerCase()} <span className="lblDim">· overflow</span></span>
+              <span className="lbl lblDim">{stbLabel.toLowerCase()} <span className="lblDim">· spare</span></span>
               <span className="val">
-                {willCap && capLabel ? [
-                  <span key="sw" className="unit">switch</span>,
-                  <span key="sl" className={capClass}>~{capLabel}</span>,
-                  capHours != null && <span key="sh" className="hint">({capHours < 24 ? capHours.toFixed(0) + "h" : (capHours / 24).toFixed(1) + "d"})</span>,
-                  <span key="sd" className="dot">·</span>,
-                ] : [
-                  <span key="ns" className="hint">no switch needed</span>,
-                  <span key="nd" className="dot">·</span>,
-                ]}
+                <span className="hint">Pro · emergency only</span>
+                <span className="dot">·</span>
                 <span className="unit">sess</span>
                 <span className={paceClass(stbSessDelta)}>{stbSessQ.toFixed(0)}%</span>
-                <span className="pbar" style={{ width: "48px" }}>
-                  <span className="fillTime" style={{ width: stbSessTime + "%" }} />
-                  <span className={"fillQuota " + paceBgClass(stbSessDelta)} style={{ width: stbSessQ + "%" }} />
-                </span>
                 <span className="dot">·</span>
                 <span className="unit">wk</span>
-                <span className={paceClass(stbWeekDelta)}>{stbWeekQ.toFixed(0)}%</span>
-                <span className="pbar" style={{ width: "48px" }}>
-                  <span className="fillTime" style={{ width: stbWeekTime + "%" }} />
-                  <span className={"fillQuota " + paceBgClass(stbWeekDelta)} style={{ width: stbWeekQ + "%" }} />
-                </span>
-                {stbDays != null && [
-                  <span key="od" className="dot">·</span>,
-                  <span key="on" className="num">{stbDays.toFixed(1)}</span>,
-                  <span key="ou" className="unit">d left</span>,
-                ]}
-                <span className="dot">·</span>
-                <span className="hint">{stbReset}</span>
+                <span className="hint">{stbWeekQ.toFixed(0)}%</span>
               </span>
-
-              <div className="tip">
-                <span className="tipHead">{stbLabel} · overflow account</span>
-                {willCap && capLabel ? [
-                  <span key="e1" className="tipKey">switch at </span>,
-                  <span key="e2" className={"tipVal " + capClass}>~{capLabel}</span>,
-                  <span key="e3" className="tipKey">  ({capHours != null ? (capHours < 24 ? capHours.toFixed(1) + "h" : (capHours / 24).toFixed(1) + "d") : "?"} from now)</span>,
-                  "\n",
-                  <span key="e4" className="tipKey">primary   </span>,
-                  <span key="e5" className="tipVal">burning {capEta.rate_pct_per_hour.toFixed(2)}%/hr → hits 100% before reset</span>,
-                  "\n",
-                  <span key="e6" className="tipKey">command   </span>,
-                  <span key="e7" className="tipVal">claude2</span>,
-                  <span key="e8" className="tipKey">  (new terminal tab when the time comes)</span>,
-                  "\n",
-                ] : [
-                  <span key="e1" className="tipKey">switch at </span>,
-                  <span key="e2" className="tipVal good">not projected — primary won't cap this week</span>,
-                  "\n",
-                ]}
-                <span className="tipKey">session   </span><span className={"tipVal " + paceClass(stbSessDelta)}>{stbSessQ.toFixed(0)}% used</span>{"\n"}
-                <span className="tipKey">weekly    </span><span className={"tipVal " + paceClass(stbWeekDelta)}>{stbWeekQ.toFixed(0)}% used</span>{"\n"}
-                <span className="tipKey">days left </span><span className="tipVal">{stbDays != null ? stbDays.toFixed(1) : "—"}</span>{"\n"}
-                <span className="tipKey">resets at </span><span className="tipVal">{stbReset}</span>
-                <span className="tipNote">
-                  Switch to claude2 when the primary account hits its weekly
-                  cap. This account absorbs the overflow at subscription
-                  rates (~50x better value than extra usage overage).
-                  {"\n\n"}alias: claude2='CLAUDE_CONFIG_DIR=~/.claude-alt claude'
-                </span>
-              </div>
             </div>
 
             {d.mac && (() => {
