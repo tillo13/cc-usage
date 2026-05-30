@@ -23,7 +23,7 @@
             tail -f /tmp/cc_usage_launchd.log
 
      The agent polls every 15 minutes (96 snapshots/day, 672/week) —
-     plenty of resolution for --validate drift math and burn-rate pacing.
+     plenty of resolution for `validate` drift math and burn-rate pacing.
      ──────────────────────────────────────────────────────────────── -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -35,8 +35,8 @@
     <array>
         <string>__PYTHON_BIN__</string>
         <string>__REPO_ROOT__/claude_code_usage.py</string>
-        <string>--snapshot-only</string>
-        <string>--source</string>
+        <string>`snapshot-only`</string>
+        <string>`source`</string>
         <string>launchd</string>
     </array>
 
@@ -44,7 +44,7 @@
     <string>__REPO_ROOT__</string>
 
     <!-- Fire every 15 min. 900s gives ~96 snapshots/day, 672/week — plenty of
-         resolution for --validate drift math and recent-burn pacing. -->
+         resolution for `validate` drift math and recent-burn pacing. -->
     <key>StartInterval</key>
     <integer>900</integer>
 
