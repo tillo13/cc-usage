@@ -791,6 +791,14 @@ export const render = ({ output, error }) => {
   // harder you could run for the rest of the week and still just hit target.
   const headroomX = weekly.headroom_x
   const utilStatus = weekly.utilization_status   // cold | warm | on-target | hot
+  // Set when Anthropic zeroed the weekly counter mid-window without moving its
+  // reset boundary (a server-side re-baseline, observed 2026-06-01). Surfaced
+  // so a discontinuous COLD jump in headroom is EXPLAINED, not mysterious.
+  const rebaselinedAt = weekly.rebaselined_at
+  const rebaseLabel = rebaselinedAt
+    ? new Date(rebaselinedAt).toLocaleTimeString("en-US",
+        { hour: "numeric", minute: "2-digit" })
+    : null
   const utilCls = utilStatus === "cold" ? "warn"
     : utilStatus === "hot" ? "crit"
     : utilStatus === "on-target" ? "good" : "num"
@@ -977,6 +985,9 @@ export const render = ({ output, error }) => {
               <span key="us" className={utilCls}>{utilStatus}</span>,
               headroomX != null && utilStatus !== "on-target" && (
                 <span key="ux" className="hint">{headroomX}× room</span>
+              ),
+              rebaseLabel && (
+                <span key="rb" className="hint" title={"Anthropic re-baselined the weekly counter at " + rebaseLabel + " (reset boundary unchanged) — headroom jumped as a result"}>↺ {rebaseLabel}</span>
               ),
             ]}
             {bridge && [

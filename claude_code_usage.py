@@ -1970,6 +1970,52 @@ def _roll_window_forward(anchor_pct, anchor_ts_iso, reset_iso, window_hours):
     return 0.0, new_window_start_dt.isoformat(), reset_dt.isoformat()
 
 
+def _detect_weekly_rebaseline(conn, week_start_iso, account="primary",
+                              min_drop=8.0):
+    """Detect a mid-week server-side weekly re-baseline.
+
+    A genuine weekly rollover ALWAYS moves the reset boundary forward (by
+    days). A server-side re-baseline — Anthropic zeroing the weekly counter
+    mid-window without touching its reset boundary — drops `seven_day_pct`
+    sharply while `seven_day_reset` stays put. Observed exactly once in the
+    snapshot history (2026-06-01 10:33 PT: 38%->0%, boundary unchanged at
+    the Saturday reset); every other sharp weekly drop on record moved the
+    boundary, i.e. was a normal rollover.
+
+    Scans snapshots within the current week and returns the ISO ts of the
+    post-drop snapshot (the effective new week start for pacing), or None
+    if no re-baseline is found. The reset boundary is treated as "unchanged"
+    when consecutive snapshots' resets are within 2h of each other — wide
+    enough to absorb the sub-minute jitter in the API's reset timestamp,
+    far narrower than the multi-day jump of a real rollover.
+    """
+    # Bound the scan to the week [start, start+168h) so a stale/odd week_start
+    # can't reach a drop in a later week. In normal operation week_start is the
+    # current week, so the upper bound is just "now" and changes nothing.
+    ws_dt = _parse_iso(week_start_iso)
+    week_end_iso = ((ws_dt + timedelta(hours=168)).isoformat()
+                    if ws_dt else "9999")
+    rows = conn.execute(
+        "SELECT ts, seven_day_pct, seven_day_reset FROM snapshots "
+        "WHERE account=? AND ts >= ? AND ts < ? AND seven_day_pct IS NOT NULL "
+        "ORDER BY ts",
+        (account, week_start_iso, week_end_iso),
+    ).fetchall()
+    anchor = None
+    prev = None  # (pct, reset_iso)
+    for ts, pct, reset in rows:
+        if prev is not None:
+            ppct, preset = prev
+            same_boundary = False
+            rd, pd = _parse_iso(reset), _parse_iso(preset)
+            if rd and pd:
+                same_boundary = abs((rd - pd).total_seconds()) < 7200
+            if same_boundary and (ppct - pct) >= min_drop:
+                anchor = ts  # most recent qualifying drop wins
+        prev = (pct, reset)
+    return anchor
+
+
 def _extrapolate_live(conn, data, anchor_ts_iso, account="primary"):
     """Advance a raw /api/oauth/usage dict to reflect live token burn.
 
@@ -2095,6 +2141,22 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET, account="primary
     # Weekly pacing: where SHOULD we be vs where we ARE (linear baseline)
     if weekly and weekly.get("reset_iso") and weekly["hours_left"] > 0:
         hours_elapsed = max(0.0, 168 - weekly["hours_left"])
+        week_start = _week_start_iso(weekly["reset_iso"])
+        # Mid-week server re-baseline flag: if Anthropic zeroed the weekly
+        # counter without moving its reset boundary (observed once, 2026-06-01),
+        # the headroom_x reading discontinuously jumps COLD because used_pct
+        # resets to ~0 while the Saturday boundary (and so hours_elapsed) is
+        # unchanged. We do NOT re-anchor hours_elapsed: pacing the fresh ~0%
+        # over the tiny post-drop window projects a noisy HOT reading off a
+        # few hours' burst, which fights the "lean in / use your quota" goal
+        # right when a near-empty bucket was handed back. Instead we surface
+        # the event so the widget can EXPLAIN the jump (↺ re-baselined) rather
+        # than mask it. The bucket-based reading ("lots of room") is the true,
+        # goal-aligned message and self-converges by the real Saturday reset.
+        rebase_ts = (_detect_weekly_rebaseline(conn, week_start, account)
+                     if week_start else None)
+        if rebase_ts:
+            weekly["rebaselined_at"] = rebase_ts
         if hours_elapsed > 0:
             ideal_now = (hours_elapsed / 168) * target
             # 2 decimals: ideal_pct creeps up ~0.01%/min, so at the widget's
@@ -2124,7 +2186,8 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET, account="primary
                     "on-target" if r <= 1.1 else
                     "hot"
                 )
-            week_start = _week_start_iso(weekly["reset_iso"])
+            # active_hours counts since the TRUE week start (real reset), not
+            # the re-baseline point — it's a raw "hours worked this cycle".
             if week_start:
                 ws = _active_hour_stats(conn, week_start, account=account)
                 if ws["active_hours"] >= 1:
@@ -2674,6 +2737,36 @@ def main():
             except Exception as e:
                 print(f"snapshot failed ({acct_id}): {e}", file=sys.stderr)
                 api_ok = False
+            # Paper trail for mid-week server re-baselines (the weekly counter
+            # zeroing without its reset boundary moving). Idempotent via
+            # event_uuid keyed on the drop ts, so re-logging the same drop on
+            # every 15-min tick is a no-op. type='system' so the documented
+            # `DELETE FROM events WHERE type != 'system'` prune never reaps it.
+            try:
+                reset_iso = (data or {}).get("seven_day", {}).get("resets_at")
+                ws = _week_start_iso(reset_iso) if reset_iso else None
+                rb = _detect_weekly_rebaseline(conn, ws, acct_id) if ws else None
+                if rb:
+                    used_now = (data or {}).get("seven_day", {}).get("utilization")
+                    dbmod.upsert_event(conn, {
+                        "event_uuid": f"quota-rebaseline:{acct_id}:{rb}",
+                        "type": "system",
+                        "subtype": "quota.weekly_rebaseline",
+                        "ts": rb,
+                        "payload_json": json.dumps({
+                            "account": acct_id,
+                            "drop_ts": rb,
+                            "reset_unchanged": reset_iso,
+                            "used_after": used_now,
+                        }),
+                    })
+                    conn.commit()
+                    print(f"weekly re-baseline detected ({acct_id}) at {rb} "
+                          f"— reset boundary unchanged ({reset_iso})",
+                          file=sys.stderr)
+            except Exception as e:
+                print(f"rebaseline-log step failed (non-fatal): {e}",
+                      file=sys.stderr)
         # Respect the backfill lock so we don't stampede the widget's
         # own backfill subprocess. max_age of 60s is generous: launchd
         # runs us every 15 min, so we'll almost always acquire — and if
