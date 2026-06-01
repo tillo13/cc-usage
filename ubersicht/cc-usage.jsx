@@ -60,8 +60,8 @@
 // REPO_ROOT is the absolute path to this cloned cc_usage repo. The
 // widget invokes `${REPO_ROOT}/claude_code_usage.py --widget-json`.
 //
-const PYTHON_BIN = "/Users/at/Desktop/code/kicksaw/venv_kicksaw/bin/python3"
-const REPO_ROOT  = "/Users/at/Desktop/code/_local_infrastructure/cc_usage"
+const PYTHON_BIN = "$HOME/Desktop/code/kicksaw/venv_kicksaw/bin/python3"
+const REPO_ROOT  = "$HOME/Desktop/code/_local_infrastructure/cc_usage"
 
 // Übersicht 1.6 exposes `run(cmd)` via the `uebersicht` module — NOT as a
 // global. Importing here makes onClick handlers in the JSX able to fire
@@ -1571,7 +1571,7 @@ export const render = ({ output, error }) => {
                         className={"macBtn " + (m.band === "crit" ? "crit" : "warn")}
                         onClick={() => {
                           try {
-                            run("/Users/at/Desktop/code/_local_infrastructure/mac_cleaner/run_in_terminal.sh")
+                            run("$HOME/Desktop/code/_local_infrastructure/mac_cleaner/run_in_terminal.sh")
                           } catch (e) { /* keep widget alive */ }
                         }}
                         title="Click to launch smart_mac_cleaner.py in a new Terminal tab"

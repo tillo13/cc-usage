@@ -28,9 +28,9 @@ Each config dir gets its own macOS keychain entry:
 Computed via: `echo -n "$HOME/.claude-alt" | shasum -a 256 | cut -c1-8` → `bae1e975`
 
 ### 3. JSONL files land in the alt config dir
-Test message from `tilloat@gmail.com` produced:
+Test message from the overflow account produced:
 ```
-~/.claude-alt/projects/-Users-at/16470cf2-9f32-4775-94bf-a0bfe672fac4.jsonl
+~/.claude-alt/projects/-Users-<user>/16470cf2-9f32-4775-94bf-a0bfe672fac4.jsonl
 ~/.claude-alt/history.jsonl
 ```
 **Not** in `~/.claude/projects/`. Complete separation.
@@ -47,8 +47,8 @@ Can be disabled/re-enabled at any time in Settings > Usage. Disabling does not a
 
 | Account | Email | Plan | Monthly cost | Role |
 |---|---|---|---|---|
-| Primary | andytillo (main) | Max 20x | $200/mo | Daily driver, all projects |
-| Overflow | tilloat@gmail.com | Max 20x | $200/mo | Full mirror — kicks in when primary hits weekly cap |
+| Primary | primary account | Max 20x | $200/mo | Daily driver, all projects |
+| Overflow | overflow account | Max 20x | $200/mo | Full mirror — kicks in when primary hits weekly cap |
 
 ### Access
 
