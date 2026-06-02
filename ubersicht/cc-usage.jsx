@@ -551,6 +551,18 @@ export const className = `
     50%      { opacity: 0.35; }
   }
 
+  /* ═══ Session cap alert ═══
+     Fires when the 5h session will hit 100% (≥90% used OR projected to cap
+     before the window resets — whichever first). Red, pulsing "⚠ CAPS IN Nm"
+     so a heads-down user catches it on a glance. In-widget only by design. */
+  .capAlert {
+    color: #FF5A5A;
+    font-family: "SF Mono", ui-monospace, "JetBrains Mono", monospace;
+    font-weight: 800;
+    letter-spacing: 0.02em;
+    animation: cc-nudge 1.2s ease-in-out infinite;
+  }
+
   /* ═══ Custom tooltip ═══
      Native title="" doesn't reliably render in Übersicht's WKWebView, so
      tooltips are absolute :hover divs. Matches the instrument aesthetic:
@@ -791,6 +803,16 @@ export const render = ({ output, error }) => {
   // harder you could run for the rest of the week and still just hit target.
   const headroomX = weekly.headroom_x
   const utilStatus = weekly.utilization_status   // cold | warm | on-target | hot
+  // headroomX/utilStatus are now built on the DAMPED pace estimate (server side),
+  // not the raw early-week projection, so they stop whipsawing. paceLowConf marks
+  // the pre-Wed window where the linear read can't be trusted yet → render a `*`.
+  const paceLowConf = weekly.pace_low_conf
+  // The stable primary action number: daily allowance + today's burn against it.
+  // "you can spend ~X%/day and still land at target; today you're at Y% → N× left."
+  // Unaffected by the projection swing or a mid-week re-baseline.
+  const safePerDay = weekly.safe_pct_per_day
+  const todayPct = weekly.today_pct
+  const todayRoomX = weekly.today_room_x
   // Set when Anthropic zeroed the weekly counter mid-window without moving its
   // reset boundary (a server-side re-baseline, observed 2026-06-01). Surfaced
   // so a discontinuous COLD jump in headroom is EXPLAINED, not mysterious.
@@ -931,6 +953,27 @@ export const render = ({ output, error }) => {
             </span>
             <span className={paceClass(sessDelta)}>{sessQuotaPct.toFixed(0)}%</span>
             <span className={"pill " + paceClass(sessDelta)}>{paceWord(sessDelta)}</span>
+            {/* Cap alert — when you hit the wall, and what happens then. Red +
+               pulsing; in-widget only (no OS popup). Before cap: minutes of work
+               left + how long you'd sit blocked. AT cap: if usage credits are ON
+               (extra present), you're NOT blocked — you're billing overage at
+               standard API rates, so show the live month-to-date extra spend.
+               If credits are OFF, you're blocked until the 5h reset. Verified
+               2026-06-01: extra usage triggers at the 5h SESSION limit. */}
+            {session.cap_alert && session.caps_in_min != null && [
+              <span key="cad" className="dot">·</span>,
+              <span key="cap" className="capAlert">
+                {session.caps_in_min <= 0
+                  ? (extra
+                      ? "⚠ AT CAP · billing extra $" + extra.used_dollars.toFixed(2)
+                      : "⚠ AT CAP · blocked till " + sessReset)
+                  : "⚠ CAPS IN " + session.caps_in_min + "m"
+                    + (session.will_cap_before_reset && session.cap_before_reset_min != null
+                        ? " (" + session.cap_before_reset_min + "m before reset)"
+                        : "")
+                    + (extra ? " → then extra $" : "")}
+              </span>,
+            ]}
           </span>
 
           <div className="tip">
@@ -984,10 +1027,22 @@ export const render = ({ output, error }) => {
               <span key="ud" className="dot">·</span>,
               <span key="us" className={utilCls}>{utilStatus}</span>,
               headroomX != null && utilStatus !== "on-target" && (
-                <span key="ux" className="hint">{headroomX}× room</span>
+                <span key="ux" className="hint" title={paceLowConf
+                  ? "pace estimate — LOW CONFIDENCE until ~Wed. Early-week the live projection swings wildly (and a mid-week re-baseline craters it), so this is damped toward your average daily burn so far. It firms up as the week elapses."
+                  : "how much harder you could run for the rest of the week and still just land at target, off the damped pace estimate"}
+                >~{headroomX}× room{paceLowConf ? "*" : ""}</span>
               ),
+              // Stable allowance — the primary "how much can I use right now".
+              safePerDay != null && [
+                <span key="bd2" className="dot">·</span>,
+                <span key="bg" className="num" title="DAILY ALLOWANCE — how much of your weekly quota you can spend each remaining day and still land at target. Stable: unaffected by the early-week projection swing or a re-baseline (a re-baseline just raises it).">{safePerDay.toFixed(0)}%/day</span>,
+              ],
+              todayPct != null && todayRoomX != null && [
+                <span key="td" className="dot">·</span>,
+                <span key="tt" className="hint" title="today's burn vs the daily allowance — how much more of today's pace you could still run">today {todayPct.toFixed(0)}% ({todayRoomX}× left)</span>,
+              ],
               rebaseLabel && (
-                <span key="rb" className="hint" title={"Anthropic re-baselined the weekly counter at " + rebaseLabel + " (reset boundary unchanged) — headroom jumped as a result"}>↺ {rebaseLabel}</span>
+                <span key="rb" className="hint" title={"Anthropic re-baselined the weekly counter at " + rebaseLabel + " (reset boundary unchanged) — the swing you saw was an artifact; the daily allowance is the number to trust"}>↺ {rebaseLabel}</span>
               ),
             ]}
             {bridge && [
@@ -1069,6 +1124,82 @@ export const render = ({ output, error }) => {
             </span>
           </div>
         </div>
+
+        {/* EXTRA $ — pay-as-you-go monthly overage budget. Re-added 2026-06-01
+            (removed 2026-05-30 in 3d397ef, which moved a compact $ to the identity
+            "gate" but dropped the $/day pace + projected cap-hit detail). Kept
+            ALONGSIDE the gate per Andy's call: gate = glanceable, this card =
+            hover for the pacing instrument. */}
+        {extra && [
+          <span key="xr" className="rule" />,
+          <div key="xc" className="card cardInline">
+            <span className="lbl">extra $</span>
+            <span className="val">
+              <span className="num">${extra.used_dollars.toFixed(0)}</span>
+              <span className="dot">/</span>
+              <span className="hint">${extra.cap_dollars.toFixed(0)}</span>
+              <span className="dot">·</span>
+              <span className={"num " + (extra.will_exhaust_before_reset ? "crit" : "")}>{extra.used_pct.toFixed(0)}</span>
+              <span className="unit">%</span>
+              {extra.cap_hit_label ? [
+                <span key="ce" className="dot">→</span>,
+                <span key="ch" className={"num " + (extra.will_exhaust_before_reset ? "crit" : "warn")}>cap {extra.cap_hit_label.split(",")[0]}</span>,
+              ] : extra.pace_dollars_per_day === 0 ? [
+                <span key="cs" className="dot">·</span>,
+                <span key="ct" className="hint">stable</span>,
+              ] : [
+                <span key="cs" className="dot">·</span>,
+                <span key="ct" className="hint">tracking…</span>,
+              ]}
+            </span>
+
+            <div className="tip tipRight">
+              <span className="tipHead">extra $ budget · monthly cap</span>
+              <span className="tipKey">used      </span><span className="tipVal">${extra.used_dollars.toFixed(2)}</span>{"\n"}
+              <span className="tipKey">remaining </span><span className="tipVal">${extra.remaining_dollars != null ? extra.remaining_dollars.toFixed(2) : (extra.cap_dollars - extra.used_dollars).toFixed(2)}</span>{"\n"}
+              <span className="tipKey">cap       </span><span className="tipVal">${extra.cap_dollars.toFixed(2)}</span>{"\n"}
+              <span className="tipKey">burn      </span><span className="tipVal">{extra.used_pct.toFixed(1)}% of monthly cap</span>{"\n"}
+              {"\n"}
+              {extra.pace_dollars_per_day != null ? [
+                <span key="r1" className="tipKey">rate      </span>,
+                <span key="r2" className="tipVal">${extra.pace_dollars_per_day.toFixed(2)}/day</span>,
+                <span key="r3" className="tipKey">  over last {extra.pace_lookback_hours ? (extra.pace_lookback_hours < 48 ? extra.pace_lookback_hours.toFixed(0) + "h" : (extra.pace_lookback_hours / 24).toFixed(1) + "d") : "?"}</span>,
+                "\n",
+              ] : [
+                <span key="r1" className="tipKey">rate      </span>,
+                <span key="r2" className="tipVal">— (need more snapshot history)</span>,
+                "\n",
+              ]}
+              {extra.cap_hit_label ? [
+                <span key="c1" className="tipKey">cap hit   </span>,
+                <span key="c2" className={"tipVal " + (extra.will_exhaust_before_reset ? "crit" : "warn")}>{extra.cap_hit_label}</span>,
+                <span key="c3" className="tipKey">  ({extra.days_until_cap != null ? extra.days_until_cap.toFixed(1) : "?"} days from now)</span>,
+                "\n",
+              ] : extra.pace_dollars_per_day === 0 ? [
+                <span key="c1" className="tipKey">cap hit   </span>,
+                <span key="c2" className="tipVal good">not projected</span>,
+                <span key="c3" className="tipKey">  (counter stable, no recent overage)</span>,
+                "\n",
+              ] : [
+                <span key="c1" className="tipKey">cap hit   </span>,
+                <span key="c2" className="tipVal">tracking…</span>,
+                <span key="c3" className="tipKey">  (waiting for counter to move)</span>,
+                "\n",
+              ]}
+              <span className="tipNote">
+                Month-to-date usage-credit spend (resets monthly). Accrues
+                when you hit your 5-HOUR SESSION limit with credits ON and
+                keep working — billed at standard API rates. NOT tied to the
+                weekly limit. Drawn from your prepaid balance first; the API
+                doesn't expose that balance, so this shows spend vs your
+                ${extra.cap_dollars.toFixed(0)} monthly cap. Rate computed
+                from local snapshot history (15-min cadence), so it can lag
+                the live spend by up to one poll.
+                {extra.will_exhaust_before_reset && "\n\n⚠ PROJECTED TO HIT CAP BEFORE MONTH END at current pace."}
+              </span>
+            </div>
+          </div>,
+        ]}
 
         <span className={"updated" + (activeStale ? " staleUpd" : "")}>
           <span className="pulse" />

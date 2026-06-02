@@ -2134,6 +2134,26 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET, account="primary
         return out
 
     session = _bucket(data.get("five_hour"), want_active=True)
+    if session:
+        # Session cap alert — the live pinch post-SpaceX. The bare "95% HOT"
+        # doesn't say WHEN you hit the wall, which is the actionable part. From
+        # the active-hour rate we know how many minutes of work fit in the
+        # remaining %, and whether that runs out BEFORE the window resets (i.e.
+        # you'll sit blocked-and-waiting). caps_in_min is active-work minutes;
+        # while heads-down-and-hot that ≈ wall-clock. Trigger fires on EITHER a
+        # ≥90% level OR a projected cap-before-reset, whichever comes first.
+        hr_active = session.get("headroom_active_hours")
+        sess_used = session.get("used_pct") or 0
+        reset_min = (session.get("hours_left") or 0) * 60
+        if hr_active is not None and hr_active >= 0:
+            caps_in_min = round(hr_active * 60)
+            session["caps_in_min"] = caps_in_min
+            session["will_cap_before_reset"] = caps_in_min < reset_min
+            if session["will_cap_before_reset"]:
+                session["cap_before_reset_min"] = round(reset_min - caps_in_min)
+        session["cap_alert"] = bool(
+            sess_used >= 90 or session.get("will_cap_before_reset")
+        )
     weekly = _bucket(data.get("seven_day"))
     weekly_sonnet = _bucket(data.get("seven_day_sonnet"))
     weekly_opus = _bucket(data.get("seven_day_opus"))
@@ -2168,6 +2188,17 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET, account="primary
             # what % would you land at? >target means overshoot, <target undershoot.
             weekly["projected_pct"] = round(
                 weekly["used_pct"] * (168 / hours_elapsed), 1
+            )
+            # Daily allowance — the stable, re-baseline-proof "how much can I
+            # spend right now" number: remaining room to target ÷ days left.
+            # Unlike projected_pct it never multiplies a tiny elapsed window, so
+            # it doesn't whipsaw early-week, and a mid-week re-baseline (which
+            # hands back a near-empty bucket) simply RAISES the allowance instead
+            # of cratering a ratio. This is the WEEK card's primary action number.
+            dleft_wk = weekly["hours_left"] / 24
+            weekly["safe_pct_per_day"] = (
+                round(max(0.0, (target - weekly["used_pct"]) / dleft_wk), 2)
+                if dleft_wk > 0 else None
             )
             # Utilization gauge — "am I getting my $200's worth?". headroom_x =
             # how much harder you could run (more windows / ultracode) for the
@@ -2255,6 +2286,55 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET, account="primary
                 )
                 cur_date += timedelta(days=1)
             weekly["by_day"] = by_day
+
+            # ── Damped "pace est" — tames the projected_pct whipsaw ──
+            # projected_pct = used × 168/hours_elapsed explodes early-week (the
+            # multiplier is ~14× on Sunday, ~3.8× on Monday) and craters the
+            # instant a mid-week re-baseline zeroes the counter. We blend it
+            # toward a steadier prior: "keep burning at your average COMPLETED-day
+            # rate this week." The prior is built from by_day's pct_share, which
+            # is derived from used_pct itself — so a re-baseline that rescales
+            # used_pct rescales the prior the same way and the distortion cancels
+            # (unlike a token→% ratio, which the re-baseline poisons). It also
+            # excludes today's in-progress partial day, so a morning burst can't
+            # drag it. Confidence in the live linear read grows with elapsed time
+            # (full trust by ~Wed = 84h); before then we lean on the prior and
+            # FLAG the number low-confidence (JSX shows a `*`) so it stops
+            # swinging while it genuinely can't be known yet.
+            hours_elapsed_wk = max(0.0, 168 - weekly["hours_left"])
+            linear_proj = weekly.get("projected_pct")
+            completed = [d for d in by_day
+                         if not d.get("is_today") and not d.get("is_future")]
+            if linear_proj is not None and completed and hours_elapsed_wk > 0:
+                prior_daily_pct = (
+                    sum(d.get("pct_share") or 0 for d in completed) / len(completed)
+                )
+                dleft = weekly.get("days_left") or (weekly["hours_left"] / 24)
+                prior_proj = weekly["used_pct"] + prior_daily_pct * dleft
+                w = min(1.0, hours_elapsed_wk / 84.0)
+                pace_est = round(w * linear_proj + (1.0 - w) * prior_proj, 1)
+                weekly["pace_est_pct"] = pace_est
+                weekly["pace_low_conf"] = hours_elapsed_wk < 84.0
+                # Re-point the utilization gauge at the damped estimate so the
+                # "× room" headroom and cold/warm/hot word stop whipsawing too.
+                if pace_est > 0:
+                    weekly["headroom_x"] = round(min(9.9, target / pace_est), 2)
+                    r = pace_est / target if target else 0
+                    weekly["utilization_status"] = (
+                        "cold" if r < 0.6 else
+                        "warm" if r < 0.9 else
+                        "on-target" if r <= 1.1 else
+                        "hot"
+                    )
+            # Today's burn against the daily allowance — the directly actionable
+            # "you've spent X of your ~Y%/day budget → N× room left today".
+            spd = weekly.get("safe_pct_per_day")
+            today_entry = next((d for d in by_day if d.get("is_today")), None)
+            if today_entry is not None:
+                weekly["today_pct"] = today_entry.get("pct_share")
+                tp = weekly["today_pct"] or 0
+                if spd and tp > 0:
+                    weekly["today_room_x"] = round(min(9.9, spd / tp), 1)
 
             # Weekly burn trend — last 8 weeks on the 168h reset cadence. Tracks
             # "how hot am I running" via cost-weighted tokens, which (unlike
