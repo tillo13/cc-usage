@@ -49,7 +49,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-import requests
+# NOTE: `requests` is imported lazily inside get_usage() — the only function
+# that touches the network. The hot --widget-json render path reads cached
+# snapshots and never calls the live API (get_usage is a cold-start-only
+# fallback), so importing requests at module top cost ~0.6s on every 60s
+# widget run for nothing (1,440×/day). Lazy import keeps the render path lean.
 
 # Sibling import — claude_usage_db.py lives next to this file in
 # _local_infrastructure/cc_usage/. Add our own directory to sys.path so the import
@@ -113,6 +117,7 @@ def _load_access_token(keychain_service=KEYCHAIN_SERVICE):
 
 
 def get_usage(keychain_service=KEYCHAIN_SERVICE):
+    import requests  # lazy — see import note at top; keeps the render path off it
     resp = requests.get(
         USAGE_URL,
         headers={
