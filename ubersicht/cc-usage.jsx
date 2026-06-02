@@ -917,7 +917,7 @@ export const render = ({ output, error }) => {
           <span className="lbl lblDim">claude code{standbyIsPrimary && active.account_tier === "pro" ? " · pro" : ""}</span>
           <span className="val">
             {extra ? [
-              <span key="d" className="num">${extra.used_dollars.toFixed(0)}</span>,
+              <span key="d" className="num">${extra.used_dollars.toFixed(2)}</span>,
               <span key="sl" className="dot">/</span>,
               <span key="cap" className="hint">${extra.cap_dollars.toFixed(0)}</span>,
               <span key="mid" className="dot">·</span>,
@@ -1135,7 +1135,7 @@ export const render = ({ output, error }) => {
           <div key="xc" className="card cardInline">
             <span className="lbl">extra $</span>
             <span className="val">
-              <span className="num">${extra.used_dollars.toFixed(0)}</span>
+              <span className="num">${extra.used_dollars.toFixed(2)}</span>
               <span className="dot">/</span>
               <span className="hint">${extra.cap_dollars.toFixed(0)}</span>
               <span className="dot">·</span>
