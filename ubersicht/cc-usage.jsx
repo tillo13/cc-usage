@@ -925,10 +925,16 @@ export const render = ({ output, error }) => {
               <span key="sl" className="dot">/</span>,
               <span key="cap" className="hint">${extra.cap_dollars.toFixed(0)}</span>,
               <span key="mid" className="dot">·</span>,
-              <span key="pct" className={"num " + (extra.will_exhaust_before_reset ? "crit" : "")}>{extra.used_pct.toFixed(0)}</span>,
+              <span key="pct" className={"num " + (extra.will_exhaust_before_reset ? "crit" : "")}>{Math.floor(extra.used_pct)}</span>,
               <span key="u" className="unit">%</span>,
-              extra.cap_hit_label && <span key="cd" className="dot">→</span>,
-              extra.cap_hit_label && <span key="cl" className={extra.will_exhaust_before_reset ? "crit" : "hint"}>cap {extra.cap_hit_label.split(",")[0]}</span>,
+              // Only surface a cap-HIT date when you'd actually blow the $200
+              // before it refills. Otherwise show the monthly reset (the budget
+              // resets on the 1st, so a months-out projection past the reset is
+              // meaningless and reads as a contradiction vs the CLI's "Resets Jul 1").
+              extra.will_exhaust_before_reset && extra.cap_hit_label && <span key="cd" className="dot">→</span>,
+              extra.will_exhaust_before_reset && extra.cap_hit_label && <span key="cl" className="crit">cap {extra.cap_hit_label.split(",")[0]}</span>,
+              !extra.will_exhaust_before_reset && extra.reset_label && <span key="rd" className="dot">·</span>,
+              !extra.will_exhaust_before_reset && extra.reset_label && <span key="rl" className="hint">↻ {extra.reset_label.split(",")[0]}</span>,
             ] : [
               <span key="t" className="num">{target}</span>,
               <span key="tu" className="unit">%</span>,
@@ -1143,11 +1149,17 @@ export const render = ({ output, error }) => {
               <span className="dot">/</span>
               <span className="hint">${extra.cap_dollars.toFixed(0)}</span>
               <span className="dot">·</span>
-              <span className={"num " + (extra.will_exhaust_before_reset ? "crit" : "")}>{extra.used_pct.toFixed(0)}</span>
+              <span className={"num " + (extra.will_exhaust_before_reset ? "crit" : "")}>{Math.floor(extra.used_pct)}</span>
               <span className="unit">%</span>
-              {extra.cap_hit_label ? [
+              {/* Cap-HIT date only when you'd blow $200 before the monthly
+                 refill; otherwise show the reset (resets on the 1st — a
+                 months-out projection past it is meaningless). */}
+              {extra.will_exhaust_before_reset && extra.cap_hit_label ? [
                 <span key="ce" className="dot">→</span>,
-                <span key="ch" className={"num " + (extra.will_exhaust_before_reset ? "crit" : "warn")}>cap {extra.cap_hit_label.split(",")[0]}</span>,
+                <span key="ch" className="num crit">cap {extra.cap_hit_label.split(",")[0]}</span>,
+              ] : extra.reset_label ? [
+                <span key="cs" className="dot">·</span>,
+                <span key="ct" className="hint">↻ {extra.reset_label.split(",")[0]}</span>,
               ] : extra.pace_dollars_per_day === 0 ? [
                 <span key="cs" className="dot">·</span>,
                 <span key="ct" className="hint">stable</span>,

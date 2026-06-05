@@ -254,6 +254,22 @@ def _fmt_reset(iso_ts):
     return dt.astimezone(PT).strftime("%a %b %-d, %-I:%M%p").replace(":00", "")
 
 
+def _next_monthly_reset_iso():
+    """First of next month at local midnight, as a UTC ISO string.
+
+    The /api/oauth/usage `extra_usage` block exposes NO `resets_at`, but the
+    usage-credit budget resets on the 1st of each month (the same date the
+    official CLI prints as "Resets Jul 1"). Derive it deterministically so the
+    widget can show the real reset instead of only a months-out cap-hit
+    projection. PT-anchored via the CC_USAGE_TZ override.
+    """
+    now_local = datetime.now(PT)
+    year = now_local.year + (1 if now_local.month == 12 else 0)
+    month = 1 if now_local.month == 12 else now_local.month + 1
+    first_next = datetime(year, month, 1, 0, 0, 0, tzinfo=PT)
+    return first_next.astimezone(timezone.utc).isoformat()
+
+
 def _hours_until(iso_ts):
     dt = _parse_iso(iso_ts)
     if not dt:
@@ -2489,7 +2505,10 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET, account="primary
         used_dollars = used_cents / 100
         cap_dollars = (extra.get("monthly_limit") or 0) / 100
         remaining_dollars = max(0.0, cap_dollars - used_dollars)
-        reset_iso = extra.get("resets_at")
+        # API omits resets_at for extra_usage; the credit budget resets on the
+        # 1st of each month (matches the CLI's "Resets Jul 1"). Derive it so the
+        # widget shows the real reset, not just a cap-hit projection.
+        reset_iso = extra.get("resets_at") or _next_monthly_reset_iso()
 
         # Project forward: at observed daily burn, when does the monthly
         # cap hit? The API doesn't return a `resets_at` for extra_usage,
