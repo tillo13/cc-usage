@@ -697,13 +697,17 @@ export const render = ({ output, error }) => {
   // When primary is capped (≥95%), the overflow becomes the daily driver
   // and gets promoted to the full instrument display. The capped primary
   // gets demoted to a compact "resets fri 6am → switch back" strip.
-  // Swap only if primary is truly capped AND there's >24h until reset.
-  // claude2 is a warm spare, not a daily driver — so when primary is at the
-  // threshold with hours left to reset, ride primary to ground instead of
-  // promoting an idle overflow card that reads as zeros.
+  // Swap only when primary is FULLY capped (100%) AND there's >24h until reset.
+  // claude2 is a warm spare, not a daily driver — so while primary still has any
+  // headroom (98–99%), ride it to the actual ceiling instead of prematurely
+  // promoting an idle overflow card that reads "3% cold · 9.9× room" right next
+  // to the capped strip — which reads as a contradiction (it's two accounts) and
+  // lets the last 1–2% of primary go unused. Holding at 100 forces primary to
+  // ground first. The API does emit a true 100 when capped (verified in history),
+  // so the swap still fires on a genuine cap.
   const primaryWeekPct = (primary.weekly || {}).used_pct || 0
   const primaryHoursLeft = (primary.weekly || {}).hours_left || 0
-  const primaryCapped = primaryWeekPct >= 99 && primaryHoursLeft > 24
+  const primaryCapped = primaryWeekPct >= 100 && primaryHoursLeft > 24
   const hasOverflow = overflow && overflow.session
   const active = (primaryCapped && hasOverflow) ? overflow : primary
   const standby = (primaryCapped && hasOverflow) ? primary : overflow
