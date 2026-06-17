@@ -1527,7 +1527,7 @@ def _lsof_cwd_for_pid(pid):
 def _reap_orphan_claudes():
     """Kill claude processes that aren't backed by a visible terminal window.
 
-    Two classes of orphan accumulate over time:
+    Three classes of orphan accumulate over time:
       1. T-state (stopped) — someone ctrl-z'd a claude window, then closed the
          terminal tab without `fg`'ing it. The shell parent died or the tab
          vanished, but the stopped claude lingers indefinitely.
@@ -1535,6 +1535,14 @@ def _reap_orphan_claudes():
          e.g. `tmux new-session -d -s cc ... claude`. These can run detached
          forever; the user-stated rule is "if the terminal isn't open I don't
          need it."
+      3. ppid == 1 (reparented to launchd) — the window was closed but the
+         claude survived (e.g. it had spawned a background job, so closing the
+         tab orphaned it instead of SIGHUP'ing it). No visible window backs it.
+
+    We deliberately do NOT kill claudes whose parent is another live `claude`
+    (subagent / workflow fan-out children) — those are real in-flight work
+    under an open window. If their parent dies they become ppid==1 and get
+    reaped on a later pass.
 
     Returns (killed_pids, errors) for the snapshot-only path to log if it
     cares. Idempotent — re-running on a clean machine kills nothing.
@@ -1561,6 +1569,9 @@ def _reap_orphan_claudes():
         if "T" in stat:
             to_kill.append((pid, "stopped", signal.SIGKILL))
             continue
+        if ppid == "1":
+            to_kill.append((pid, "orphan-no-window", signal.SIGTERM))
+            continue
         parent = procs.get(ppid)
         if parent and parent[2] in _MULTIPLEXER_PARENTS:
             to_kill.append((pid, f"detached-{parent[2]}", signal.SIGTERM))
@@ -1575,9 +1586,66 @@ def _reap_orphan_claudes():
     return killed, errors
 
 
+def _parse_lstart(s):
+    """Parse `ps -o lstart` ("Tue Jun 17 10:30:15 2026") to an epoch float.
+
+    Returns None if it can't be parsed (locale / format drift) — callers fall
+    back to mtime-based liveness when a process's start time is unavailable.
+    """
+    import time as _t
+    try:
+        return _t.mktime(_t.strptime(s.strip(), "%a %b %d %H:%M:%S %Y"))
+    except (ValueError, OverflowError):
+        return None
+
+
+def _claim_transcripts(files, starts):
+    """Map each live `claude` process to the ONE transcript it's driving.
+
+    `files`  : [(mtime, path, host, birthtime), ...] candidates in one dir.
+    `starts` : [start_epoch | None, ...] one per live claude process in that
+               dir (from _live_claude_project_dirs).
+
+    A freshly launched claude creates its session JSONL within seconds of the
+    process start (observed Δ 3–50s), so the file born just after `start` is
+    that process's transcript. A resumed session reopens an older file
+    (birthtime predates the launch); for those we fall back to the freshest
+    file written since the process started. N processes claim N distinct files.
+
+    This is the fix for "stale windows": a window that was closed has no
+    process, so its transcript is never claimed and drops off the widget on
+    the next render — instead of lingering because its frozen mtime happened to
+    be the newest in the dir (the old top-N-by-mtime heuristic's failure mode).
+    """
+    pool = list(files)
+    usable = sorted(s for s in starts if s is not None)
+    n_unknown = sum(1 for s in starts if s is None)
+    claimed = []
+    for st in usable:
+        born_after = [f for f in pool
+                      if f[3] is not None and -10 <= f[3] - st <= 180]
+        if born_after:
+            pick = min(born_after, key=lambda f: abs(f[3] - st))
+        else:
+            since = [f for f in pool if f[0] >= st - 10]
+            pick = max(since, key=lambda f: f[0]) if since else None
+        if pick is None and pool:
+            pick = max(pool, key=lambda f: f[0])  # last resort: freshest
+        if pick is not None:
+            claimed.append(pick)
+            pool.remove(pick)
+    # Processes whose start time couldn't be parsed: fall back to the freshest
+    # remaining transcripts (the old top-N-by-mtime behavior) for those slots.
+    if n_unknown and pool:
+        pool.sort(key=lambda f: -f[0])
+        claimed.extend(pool[:n_unknown])
+    return claimed
+
+
 def _live_claude_project_dirs():
-    """Return {project_dir_name: live_process_count} for every project where
-    a `claude` CLI process is currently running.
+    """Return {project_dir_name: [process_start_epoch | None, ...]} for every
+    project where a `claude` CLI process is currently running (one list entry
+    per live process, so len() is the live window count for that dir).
 
     Used to filter out "ghost sessions" — JSONL files whose mtime is still
     within the activity window because the file was last touched a few
@@ -1612,37 +1680,52 @@ def _live_claude_project_dirs():
     """
     try:
         ps_out = subprocess.run(
-            ["ps", "-axo", "pid=,ppid=,stat=,comm="],
-            capture_output=True, text=True, timeout=3,
+            ["ps", "-axo", "pid=,ppid=,stat=,comm=,lstart="],
+            capture_output=True, text=True, errors="replace", timeout=3,
         ).stdout
     except (subprocess.SubprocessError, FileNotFoundError, OSError):
         return {}
 
     # Index every process so we can look up a claude's parent COMM and skip
-    # ones whose visible window isn't actually visible.
-    all_procs = {}  # pid -> (ppid, stat, comm)
+    # ones whose visible window isn't actually visible. `lstart` is appended
+    # LAST because it contains spaces ("Tue Jun 17 10:30:15 2026"); comm is a
+    # single token, so split(None, 4) cleanly peels [pid, ppid, stat, comm,
+    # lstart]. The start epoch ties each process to its transcript file below.
+    all_procs = {}  # pid -> (ppid, stat, comm, start_epoch|None)
     for line in ps_out.splitlines():
-        parts = line.strip().split(None, 3)
-        if len(parts) == 4:
-            all_procs[parts[0]] = (parts[1], parts[2], parts[3])
+        parts = line.strip().split(None, 4)
+        if len(parts) == 5:
+            all_procs[parts[0]] = (parts[1], parts[2], parts[3],
+                                   _parse_lstart(parts[4]))
 
-    # Filters:
+    # Filters — a "window" is a claude attached to a VISIBLE terminal only:
     #  - T-state (stopped) — ctrl-z'd, no visible window, cwd still readable
     #    so it would double-count under lsof.
     #  - Parent is a terminal multiplexer (tmux/screen/dtach/byobu) — those
-    #    claudes can be detached and not attached to any visible window. The
-    #    user's "open windows" definition is visible terminals only.
+    #    claudes can be detached and not attached to any visible window.
+    #  - ppid == 1 (reparented to launchd) — its launching shell/window is
+    #    gone, so the claude is a leftover orphan, not an open window. This is
+    #    the "closed the window but a hidden claude survived" case.
+    #  - Parent is itself `claude` — a subagent / workflow fan-out child. It
+    #    shares the parent's cwd, so without this it would inflate that dir's
+    #    window count (e.g. two `code/kumori` for one open kumori terminal).
     _MULTIPLEXER_PARENTS = {"tmux", "tmux:", "screen", "dtach", "byobu"}
     pids = []
-    for pid, (ppid, stat, comm) in all_procs.items():
+    pid_start = {}
+    for pid, (ppid, stat, comm, start) in all_procs.items():
         if comm != "claude":
             continue
         if "T" in stat:
             continue
+        if ppid == "1":
+            continue
         parent = all_procs.get(ppid)
         if parent and parent[2] in _MULTIPLEXER_PARENTS:
             continue
+        if parent and parent[2] == "claude":
+            continue
         pids.append(pid)
+        pid_start[pid] = start
 
     if not pids:
         _save_lsof_blocklist({})
@@ -1664,7 +1747,7 @@ def _live_claude_project_dirs():
                 blocked[pid] = now
                 continue
             encoded = cwd.replace("/", "-").replace("_", "-")
-            dirs[encoded] = dirs.get(encoded, 0) + 1
+            dirs.setdefault(encoded, []).append(pid_start.get(pid))
 
     _save_lsof_blocklist(blocked)
     return dirs
@@ -1729,57 +1812,62 @@ def live_session_stats(window_min=20, max_sessions=None, path_override=None):
         return []
     rog_cutoff = now - max(window_min, 25) * 60   # mirror lag (~15m) + a little slack
 
-    live_project_counts = _live_claude_project_dirs()
+    # {encoded_cwd: [process_start_epoch, ...]} — one entry per live claude
+    # process. ps+lsof has already proven which windows are open; the start
+    # epochs let us map each process to the exact transcript it's driving.
+    live_starts = _live_claude_project_dirs()
 
-    # Group candidate JSONLs by project dir, then take top-N per dir where
-    # N is the live process count for that dir (so two concurrent windows in
-    # the same repo both get represented). If live_project_counts is empty
-    # (ps/lsof failed), we skip this filter entirely and keep all mtime-fresh
-    # JSONLs — same as the old behavior.
-    # When `live_project_counts` is populated, ps+lsof has already proven
-    # which windows are open. In that case the mtime cutoff is wrong — a
-    # freshly-opened terminal that hasn't typed anything yet still has a real
-    # live `claude` process, and we want it on the widget immediately. So we
-    # drop the cutoff for projects backed by a live process, and only apply
-    # it as a fallback when ps/lsof failed (live_project_counts empty).
-    # Bucket every candidate JSONL by project_dir across BOTH roots combined
-    # (not per root) — otherwise a project that happens to exist in both
-    # ~/.claude/projects/ and ~/.claude-alt/projects/ doubles up and we end up
-    # pulling 16-day-old transcripts to fill the per-root quota. Picking the
-    # N most-recent globally gives us the actual live window(s).
+    # Group candidate JSONLs by project dir, then claim one transcript per live
+    # process via _claim_transcripts (start-epoch ↔ file birthtime). This is
+    # what kills stale windows: a closed terminal has no process, so its
+    # transcript is never claimed — regardless of how fresh its mtime is.
+    # If live_starts is empty (ps/lsof failed) we fall back to pure
+    # mtime-fresh filtering (old behavior).
+    # When live_starts is populated the mtime cutoff is wrong — a freshly
+    # opened terminal that hasn't typed yet still has a real live process and
+    # belongs on the widget immediately — so we only apply the cutoff on the
+    # ps/lsof-failed fallback path.
+    # Bucket across BOTH roots combined (not per root): a project present in
+    # ~/.claude/projects/ and ~/.claude-alt/projects/ shares one dir name, and
+    # the per-process claim picks the right file regardless of root.
     by_project = {}
     for root, host in project_roots:
         for f in root.glob("*/*.jsonl"):
             proj = f.parent.name
             try:
-                mt = f.stat().st_mtime
+                st = f.stat()
+                mt = st.st_mtime
             except OSError:
                 continue
+            bt = getattr(st, "st_birthtime", None)
             if host == "rog":
                 # Remote box — can't ps it. Pure mtime liveness, wider cutoff.
                 if mt < rog_cutoff:
                     continue
             else:
-                if live_project_counts and proj not in live_project_counts:
+                if live_starts and proj not in live_starts:
                     continue  # ghost — no claude process has that cwd
-                if not live_project_counts and mt < cutoff:
+                if not live_starts and mt < cutoff:
                     continue  # fallback path: no live signal, fall back to mtime
-            by_project.setdefault((host, proj), []).append((mt, f, host))
+            by_project.setdefault((host, proj), []).append((mt, f, host, bt))
 
     candidates = []
     for (host, proj), files in by_project.items():
-        files.sort(key=lambda x: -x[0])  # newest mtime first
         if host == "rog":
-            keep = len(files)  # no ps signal; mtime cutoff already pruned
+            files.sort(key=lambda x: -x[0])  # no ps signal; mtime-pruned already
+            candidates.extend(files)
+        elif live_starts:
+            # One transcript per live process, matched by start ↔ birthtime.
+            candidates.extend(_claim_transcripts(files, live_starts.get(proj, [])))
         else:
-            keep = live_project_counts.get(proj, len(files)) if live_project_counts else len(files)
-        candidates.extend(files[:keep])
+            files.sort(key=lambda x: -x[0])  # ps/lsof failed — mtime fallback
+            candidates.extend(files)
 
     if not candidates:
         return []
 
     results = []
-    for mtime, path, host in candidates:
+    for mtime, path, host, _bt in candidates:
         stats = _scan_session_file(path)
         if not stats:
             continue
