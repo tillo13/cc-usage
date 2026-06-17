@@ -1698,31 +1698,24 @@ def _live_claude_project_dirs():
             all_procs[parts[0]] = (parts[1], parts[2], parts[3],
                                    _parse_lstart(parts[4]))
 
-    # Filters — a "window" is a claude attached to a VISIBLE terminal only:
-    #  - T-state (stopped) — ctrl-z'd, no visible window, cwd still readable
-    #    so it would double-count under lsof.
-    #  - Parent is a terminal multiplexer (tmux/screen/dtach/byobu) — those
-    #    claudes can be detached and not attached to any visible window.
-    #  - ppid == 1 (reparented to launchd) — its launching shell/window is
-    #    gone, so the claude is a leftover orphan, not an open window. This is
-    #    the "closed the window but a hidden claude survived" case.
-    #  - Parent is itself `claude` — a subagent / workflow fan-out child. It
-    #    shares the parent's cwd, so without this it would inflate that dir's
-    #    window count (e.g. two `code/kumori` for one open kumori terminal).
-    _MULTIPLEXER_PARENTS = {"tmux", "tmux:", "screen", "dtach", "byobu"}
+    # A "window" is a claude that is the FOREGROUND process of a controlling
+    # terminal — i.e. an open, visible terminal tab. ps reports that with a
+    # "+" in the stat field. Requiring it in one check excludes everything
+    # that is NOT a visible window:
+    #   - subagent / workflow fan-out children (claude→...→claude) — they run
+    #     in the background, never foreground the tty, so no "+". (A direct
+    #     parent==claude check missed these when spawned via an intermediate
+    #     shell, which is what surfaced a phantom 2nd `code/kumori`.)
+    #   - reparented orphans (ppid==1, "closed the window but the claude
+    #     survived") — no controlling terminal, no "+".
+    #   - backgrounded `claude &`, ctrl-z'd (T-state), and tmux/screen-detached
+    #     sessions — none hold the tty foreground, none get "+".
     pids = []
     pid_start = {}
     for pid, (ppid, stat, comm, start) in all_procs.items():
         if comm != "claude":
             continue
-        if "T" in stat:
-            continue
-        if ppid == "1":
-            continue
-        parent = all_procs.get(ppid)
-        if parent and parent[2] in _MULTIPLEXER_PARENTS:
-            continue
-        if parent and parent[2] == "claude":
+        if "+" not in stat:
             continue
         pids.append(pid)
         pid_start[pid] = start
