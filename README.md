@@ -123,6 +123,96 @@ Every table has a stable UUID as its `UNIQUE` key, so the backfill is
 **idempotent** — rerun it against any JSONL history, any number of
 times, and it never doubles up.
 
+#### Where the token numbers come from (and how to verify them yourself)
+
+The token counts — including the cache numbers people ask about — are
+**not estimated, tokenized locally, or inferred**. They are copied
+verbatim from Anthropic's own API responses. Every time Claude Code
+gets a reply from the API, it writes the server-returned `usage` object
+into the assistant line of the session transcript at
+`~/.claude/projects/<project>/<session>.jsonl`:
+
+```json
+"usage": {
+  "input_tokens": 2,
+  "output_tokens": 676,
+  "cache_read_input_tokens": 80997,
+  "cache_creation_input_tokens": 805,
+  "cache_creation": {
+    "ephemeral_5m_input_tokens": 0,
+    "ephemeral_1h_input_tokens": 805
+  }
+}
+```
+
+That block is what Anthropic billed the turn at — the same numbers an
+API customer would see on their invoice line. cc-usage just persists
+them into the `turns` table, one row per assistant message. So the
+chain of custody is: **Anthropic's server → Claude Code's transcript →
+SQLite**, with no math in between.
+
+The big `cache_read_input_tokens` values are real, and they dominate:
+every reply re-reads the entire conversation so far through the prompt
+cache, so a long session's cache reads grow quadratically while its
+output grows linearly. Multi-billion-token monthly cache reads are the
+expected signature of heavy agentic use, not a bug.
+
+**Verify it yourself** — sum any transcript directly (stdlib only, no
+dependencies) and compare against the DB:
+
+```sh
+python3 -c '
+import json, sys
+t = {"n":0,"input":0,"output":0,"cache_read":0,"cache_write":0}
+for line in open(sys.argv[1]):
+    try: d = json.loads(line)
+    except: continue
+    if d.get("type") != "assistant": continue
+    u = (d.get("message") or {}).get("usage") or {}
+    if not u: continue
+    t["n"] += 1
+    t["input"] += u.get("input_tokens",0)
+    t["output"] += u.get("output_tokens",0)
+    t["cache_read"] += u.get("cache_read_input_tokens",0)
+    t["cache_write"] += u.get("cache_creation_input_tokens",0)
+print(t)' ~/.claude/projects/<project>/<session-uuid>.jsonl
+
+sqlite3 data/claude_usage.db "SELECT COUNT(*), SUM(input_tokens),
+  SUM(output_tokens), SUM(cache_read_input_tokens),
+  SUM(cache_creation_input_tokens) FROM turns
+  WHERE session_id='<session-uuid>'"
+```
+
+Worked example (a real 55-turn session, verified 2026-07-04):
+
+| Source | turns | input | output | cache_read | cache_write |
+|---|---|---|---|---|---|
+| raw JSONL sum | 55 | 18,500 | 43,949 | 3,592,539 | 359,114 |
+| `turns` table | 55 | 18,500 | 43,949 | 3,592,539 | 359,114 |
+
+Identical to the token — the backfill is a copy, not a model. (If the
+DB trails the transcript by a turn or two, that's the 15-minute
+backfill interval; run `python3 claude_usage_backfill.py --since 2h`
+and re-compare.)
+
+**Dollar figures** are a separate, second step: measured tokens × the
+published per-model API rate card. Subscription plans expose no dollar
+or token numbers server-side (the usage endpoint reports rounded
+percentages of undisclosed limits), so every `$` in this tool is an
+*API-equivalent counterfactual* — what the same traffic would have cost
+as metered API usage — not something Anthropic billed. Two honest
+footnotes on that math:
+
+- The widget's per-window `$X/r` badge is deliberately a **floor**: it
+  prices only the cached-context re-read on each reply (context tokens
+  × the cache-read rate), because that's the dominant and monotonically
+  growing cost of a long session. Output and cache-write costs are
+  excluded from the badge.
+- Only surfaces that write transcript JSONLs are counted (Claude Code
+  on this machine plus any mirrored hosts). claude.ai web and mobile
+  chat usage never touches these files and is invisible to this tool,
+  so totals are a lower bound on all-surfaces usage.
+
 ### 3. Pacing + forecasting CLI
 
 ```sh
