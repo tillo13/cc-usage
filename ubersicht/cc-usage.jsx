@@ -825,6 +825,15 @@ export const render = ({ output, error }) => {
     ? new Date(rebaselinedAt).toLocaleTimeString("en-US",
         { hour: "numeric", minute: "2-digit" })
     : null
+  // ── scoped limits (generic parse of the limits[] array, 2026-07 API shape) ──
+  // Anthropic now ships per-model / per-surface scoped weekly limits alongside
+  // the all-models bar (first sighting: Fable at 50%-of-plan through Jul 7,
+  // binding at 85% while all-models read 44%). Chip any entry that is active
+  // or elevated; no scoped limits → no chip (the normal state). No model
+  // names are hardcoded — whatever Anthropic scopes next surfaces unchanged.
+  const scopedLimits = (Array.isArray(active.scoped_limits) ? active.scoped_limits : [])
+    .filter((l) => l && (l.active || (l.severity && l.severity !== "normal")))
+
   const utilCls = utilStatus === "cold" ? "warn"
     : utilStatus === "hot" ? "crit"
     : utilStatus === "on-target" ? "good" : "num"
@@ -1055,6 +1064,21 @@ export const render = ({ output, error }) => {
                 <span key="rb" className="hint" title={"Anthropic re-baselined the weekly counter at " + rebaseLabel + " (reset boundary unchanged) — the swing you saw was an artifact; the daily allowance is the number to trust"}>↺ {rebaseLabel}</span>
               ),
             ]}
+            {/* Scoped-limit chips — a per-model/per-surface weekly limit that is
+               active or elevated (severity != normal). This is the BINDING limit
+               when it's hotter than the all-models bar to its left. */}
+            {scopedLimits.map((l, i) => {
+              const pct = Math.round(l.used_pct || 0)
+              const cls = (pct >= 95 || l.severity === "critical") ? "crit" : "warn"
+              return [
+                <span key={"sld" + i} className="dot">·</span>,
+                <span key={"sl" + i} className={cls}
+                  title={l.label + " has its own " + (l.group || "weekly") +
+                    " limit, separate from the all-models % — and it's currently the one to watch. " +
+                    "Resets " + (l.reset_label || "with the weekly window") + "."}
+                >{(l.label || "?").toLowerCase()} {pct}%{pct >= 80 ? "⚠" : ""}</span>,
+              ]
+            })}
             {bridge && [
               <span key="bd" className="dot">·</span>,
               <span key="bl" className="unit">7d</span>,

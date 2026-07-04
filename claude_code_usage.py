@@ -2235,6 +2235,36 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET, account="primary
                 out["reset_time_local"] = rs_dt.astimezone(PT).strftime("%-I:%M%p %a").lower()
         return out
 
+    def _scoped_limits(d):
+        # Generic parse of the `limits[]` array (new API shape, 2026-07).
+        # Anthropic now ships per-model / per-surface scoped limits here
+        # (first sighting: Fable weekly at 50%-of-plan through Jul 7) and
+        # the legacy top-level per-model fields (seven_day_opus/_sonnet)
+        # went null. Only SCOPED entries are surfaced — session/weekly_all
+        # duplicate the first-class five_hour/seven_day buckets above. No
+        # model names are hardcoded: whatever they scope next shows up
+        # with zero code changes.
+        out = []
+        for lim in (d.get("limits") or []):
+            if not isinstance(lim, dict):
+                continue
+            scope = lim.get("scope") or {}
+            label = ((scope.get("model") or {}).get("display_name")
+                     or scope.get("surface"))
+            if not label:
+                continue
+            reset_iso = lim.get("resets_at")
+            out.append({
+                "label": label,
+                "used_pct": lim.get("percent"),
+                "severity": lim.get("severity"),   # normal | warning | ...
+                "active": bool(lim.get("is_active")),
+                "group": lim.get("group"),         # session | weekly
+                "reset_iso": reset_iso,
+                "reset_label": _fmt_reset(reset_iso) if reset_iso else None,
+            })
+        return out
+
     session = _bucket(data.get("five_hour"), want_active=True)
     if session:
         # Session cap alert — the live pinch post-SpaceX. The bare "95% HOT"
@@ -2661,6 +2691,7 @@ def widget_payload(data=None, conn=None, target=DEFAULT_TARGET, account="primary
         "weekly": weekly,
         "weekly_sonnet": weekly_sonnet,
         "weekly_opus": weekly_opus,
+        "scoped_limits": _scoped_limits(data),
         "today": today,
         "live_sessions": live_session_stats(window_min=20, max_sessions=None),
         "contributors": _burn_contributors(conn, hours=24, account=account),
