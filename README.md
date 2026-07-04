@@ -113,7 +113,7 @@ cc-usage parses it into six normalized tables:
 | Table          | What it holds |
 |----------------|---------------|
 | `snapshots`    | Polls of `/api/oauth/usage` (Anthropic's authoritative quota %) — every 15 min by the launchd agent |
-| `turns`        | One row per assistant message: input/output/cache tokens, model, project, duration, stop reason |
+| `turns`        | One row per billed API response: input/output/cache tokens, model, project, duration, stop reason |
 | `tool_calls`   | One row per `tool_use` block (tool name, input JSON, payload size) |
 | `tool_results` | One row per `tool_result` (error flag, result size), paired with `tool_calls` via `tool_use_id` |
 | `user_prompts` | One row per user event (real prompts + tool wrappers), with length and pasted-image counts |
@@ -146,10 +146,28 @@ into the assistant line of the session transcript at
 ```
 
 That block is what Anthropic billed the turn at — the same numbers an
-API customer would see on their invoice line. cc-usage just persists
-them into the `turns` table, one row per assistant message. So the
-chain of custody is: **Anthropic's server → Claude Code's transcript →
-SQLite**, with no math in between.
+API customer would see on their invoice line. So the chain of custody
+is: **Anthropic's server → Claude Code's transcript → SQLite**, with
+exactly one transformation in between, and it matters:
+
+**You cannot naively sum the transcript.** Claude Code writes one
+`assistant` line *per content block* — a reply that thinks, calls three
+tools, and writes text spans several JSONL lines, all sharing the same
+`message.id` and `requestId`, and **each line repeats the `usage`
+object**. On current versions the copies are identical; on older
+versions (≤ ~2.1.96) they're a running tally where only the last line
+of the group holds the final billed counts. Summing per line
+overcounts real usage by roughly 2× (measured 2.1–2.6× across a real
+history). This isn't a cc-usage quirk — Anthropic's own Agent SDK docs
+warn "multiple messages share the same `id` with identical usage data…
+always deduplicate by ID", and it's why ccusage keys its dedupe on
+`(message.id, requestId)`.
+
+cc-usage therefore stores **one `turns` row per billed API response**:
+the backfill collapses each `(message.id, requestId)` group, keeping
+the last line's usage (the final tally) and summing the per-line
+content-block stats. `SUM()` over `turns` matches what Anthropic
+billed, not what the transcript happens to repeat.
 
 The big `cache_read_input_tokens` values are real, and they dominate:
 every reply re-reads the entire conversation so far through the prompt
@@ -157,24 +175,27 @@ cache, so a long session's cache reads grow quadratically while its
 output grows linearly. Multi-billion-token monthly cache reads are the
 expected signature of heavy agentic use, not a bug.
 
-**Verify it yourself** — sum any transcript directly (stdlib only, no
-dependencies) and compare against the DB:
+**Verify it yourself** — dedupe-sum any transcript directly (stdlib
+only, no dependencies) and compare against the DB:
 
 ```sh
 python3 -c '
 import json, sys
-t = {"n":0,"input":0,"output":0,"cache_read":0,"cache_write":0}
+resp = {}   # (message.id, requestId) -> usage; last line of a group wins
 for line in open(sys.argv[1]):
     try: d = json.loads(line)
     except: continue
     if d.get("type") != "assistant": continue
-    u = (d.get("message") or {}).get("usage") or {}
-    if not u: continue
-    t["n"] += 1
-    t["input"] += u.get("input_tokens",0)
-    t["output"] += u.get("output_tokens",0)
-    t["cache_read"] += u.get("cache_read_input_tokens",0)
-    t["cache_write"] += u.get("cache_creation_input_tokens",0)
+    m = d.get("message") or {}
+    u = m.get("usage") or {}
+    if "output_tokens" not in u: continue
+    resp[(m.get("id") or d.get("uuid"), d.get("requestId"))] = u
+t = {"n": len(resp), "input":0, "output":0, "cache_read":0, "cache_write":0}
+for u in resp.values():
+    t["input"] += u.get("input_tokens") or 0
+    t["output"] += u.get("output_tokens") or 0
+    t["cache_read"] += u.get("cache_read_input_tokens") or 0
+    t["cache_write"] += u.get("cache_creation_input_tokens") or 0
 print(t)' ~/.claude/projects/<project>/<session-uuid>.jsonl
 
 sqlite3 data/claude_usage.db "SELECT COUNT(*), SUM(input_tokens),
@@ -183,17 +204,19 @@ sqlite3 data/claude_usage.db "SELECT COUNT(*), SUM(input_tokens),
   WHERE session_id='<session-uuid>'"
 ```
 
-Worked example (a real 55-turn session, verified 2026-07-04):
+Worked example (a real session, verified 2026-07-04 — 137 assistant
+lines in the transcript, 57 billed responses after dedupe; a naive
+per-line sum would have claimed 158,498 output tokens, 2.5× the truth):
 
-| Source | turns | input | output | cache_read | cache_write |
+| Source | responses | input | output | cache_read | cache_write |
 |---|---|---|---|---|---|
-| raw JSONL sum | 55 | 18,500 | 43,949 | 3,592,539 | 359,114 |
-| `turns` table | 55 | 18,500 | 43,949 | 3,592,539 | 359,114 |
+| deduped JSONL sum | 57 | 6,828 | 63,605 | 5,317,734 | 102,050 |
+| `turns` table | 57 | 6,828 | 63,605 | 5,317,734 | 102,050 |
 
-Identical to the token — the backfill is a copy, not a model. (If the
-DB trails the transcript by a turn or two, that's the 15-minute
-backfill interval; run `python3 claude_usage_backfill.py --since 2h`
-and re-compare.)
+Identical to the token — the backfill is a copy plus the dedupe, not a
+model. (If the DB trails the transcript by a turn or two, that's the
+15-minute backfill interval; run `python3 claude_usage_backfill.py
+--since 2h` and re-compare.)
 
 **Dollar figures** are a separate, second step: measured tokens × the
 published per-model API rate card. Subscription plans expose no dollar

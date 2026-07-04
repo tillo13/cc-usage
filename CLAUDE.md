@@ -118,6 +118,20 @@ var (any IANA zone name). Default is `America/Los_Angeles`.
 - Backfill is idempotent via `UNIQUE(message_uuid)` / `UNIQUE(tool_use_id)`
   on each table, so the 2h overlap window run by the launchd agent is
   free.
+- **One `turns` row per billed API response, NOT per assistant JSONL line**
+  (fixed 2026-07-04). Claude Code writes one assistant line per content
+  block; all lines of one response share `(message.id, requestId)` and each
+  repeats the `usage` object (identical copies on current CC; a running
+  tally on ≤ ~2.1.96 where only the LAST line is the final billed count).
+  Naive per-line summing overcounted ~2.1–2.6×. The backfill merges each
+  group via `_TurnMerger` (canonical row = last line: final usage, the uuid
+  `system.turn_duration` parents to; content-block stats summed;
+  tool_calls remapped to the canonical uuid), and `_scan_session_file` in
+  the widget path dedupes the same way. Anthropic's Agent SDK docs mandate
+  this dedupe; ccusage keys on the same pair. The one-time DB collapse ran
+  via `_dedupe_turns_migration` (guarded by `PRAGMA user_version = 1`).
+  Never "simplify" back to per-line rows, and treat any new JSONL-summing
+  code path as wrong until it dedupes on `(message.id, requestId)`.
 - Schema migrations are forward-only via `PRAGMA table_info` + in-place
   `ALTER TABLE ADD COLUMN` — safe to call against a stale DB.
 - **Only `type='system'` events are ingested.** `_extract_event` stores

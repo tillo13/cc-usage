@@ -6,9 +6,13 @@ Six tables:
     snapshots     — poll results from /api/oauth/usage (Anthropic's
                     authoritative weekly/session quota view, as % utilization
                     + reset timestamps)
-    turns         — one row per assistant message, backfilled from
+    turns         — ONE row per billed API response, backfilled from
                     ~/.claude/projects/*/*.jsonl (per-turn token counts +
-                    session + project + model metadata + content stats)
+                    session + project + model metadata + content stats).
+                    A response spans multiple JSONL lines (one per content
+                    block) sharing a message_id/request_id; the backfill
+                    merges those into a single row so SUM() over this table
+                    matches what Anthropic actually billed.
     tool_calls    — one row per `tool_use` block inside an assistant turn
                     (tool name, input JSON, size). Answers "which tools did I
                     use and how often."
@@ -93,6 +97,7 @@ CREATE INDEX IF NOT EXISTS idx_turns_ts ON turns(ts);
 CREATE INDEX IF NOT EXISTS idx_turns_session_ts ON turns(session_id, ts);
 CREATE INDEX IF NOT EXISTS idx_turns_project_ts ON turns(project_cwd, ts);
 CREATE INDEX IF NOT EXISTS idx_turns_model_ts ON turns(model, ts);
+CREATE INDEX IF NOT EXISTS idx_turns_msgid ON turns(message_id, request_id);
 
 CREATE TABLE IF NOT EXISTS tool_calls (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -232,6 +237,86 @@ def _apply_migrations(conn):
         ON snapshots(account, ts)
     """)
     conn.commit()
+    _dedupe_turns_migration(conn)
+
+
+def _dedupe_turns_migration(conn):
+    """One-time collapse of per-line turns rows into one row per response.
+
+    Historic backfills stored one turns row per assistant JSONL line, but a
+    single billed API response spans multiple lines (one per content block)
+    that repeat the usage object — so SUM() over turns overcounted ~2×.
+    Keep the LAST line's row per (message_id, request_id): it carries the
+    final usage tally (older CC versions wrote a running tally) and is the
+    uuid that system.turn_duration events parent to. Content-block stats
+    are summed into the survivor, tool_calls are remapped to it, the rest
+    are deleted. Guarded by PRAGMA user_version so it runs exactly once.
+    """
+    if conn.execute("PRAGMA user_version").fetchone()[0] >= 1:
+        return
+    conn.execute("BEGIN")
+    conn.execute("""
+        CREATE TEMP TABLE dupe AS
+        SELECT message_id, COALESCE(request_id, '') AS rid, MAX(id) AS keep_id
+          FROM turns
+         WHERE message_id IS NOT NULL
+         GROUP BY 1, 2
+        HAVING COUNT(*) > 1
+    """)
+    conn.execute("CREATE INDEX temp.idx_dupe ON dupe(message_id, rid)")
+    conn.execute("""
+        CREATE TEMP TABLE gsum AS
+        SELECT t.message_id, COALESCE(t.request_id, '') AS rid,
+               SUM(COALESCE(t.num_thinking_blocks, 0)) AS s_thinking,
+               SUM(COALESCE(t.thinking_chars, 0))      AS s_thinking_chars,
+               SUM(COALESCE(t.num_text_blocks, 0))     AS s_text,
+               SUM(COALESCE(t.text_chars, 0))          AS s_text_chars,
+               SUM(COALESCE(t.num_tool_uses, 0))       AS s_tool_uses,
+               MAX(t.duration_ms)                      AS m_duration
+          FROM turns t
+          JOIN dupe d ON d.message_id = t.message_id
+                     AND d.rid = COALESCE(t.request_id, '')
+         GROUP BY 1, 2
+    """)
+    conn.execute("CREATE INDEX temp.idx_gsum ON gsum(message_id, rid)")
+    conn.execute("""
+        UPDATE turns SET
+            num_thinking_blocks = (SELECT s_thinking FROM gsum g
+                WHERE g.message_id = turns.message_id AND g.rid = COALESCE(turns.request_id, '')),
+            thinking_chars = (SELECT s_thinking_chars FROM gsum g
+                WHERE g.message_id = turns.message_id AND g.rid = COALESCE(turns.request_id, '')),
+            num_text_blocks = (SELECT s_text FROM gsum g
+                WHERE g.message_id = turns.message_id AND g.rid = COALESCE(turns.request_id, '')),
+            text_chars = (SELECT s_text_chars FROM gsum g
+                WHERE g.message_id = turns.message_id AND g.rid = COALESCE(turns.request_id, '')),
+            num_tool_uses = (SELECT s_tool_uses FROM gsum g
+                WHERE g.message_id = turns.message_id AND g.rid = COALESCE(turns.request_id, '')),
+            duration_ms = COALESCE(duration_ms, (SELECT m_duration FROM gsum g
+                WHERE g.message_id = turns.message_id AND g.rid = COALESCE(turns.request_id, '')))
+        WHERE id IN (SELECT keep_id FROM dupe)
+    """)
+    conn.execute("""
+        CREATE TEMP TABLE remap AS
+        SELECT t.message_uuid AS old_uuid, kt.message_uuid AS keep_uuid
+          FROM turns t
+          JOIN dupe d ON d.message_id = t.message_id
+                     AND d.rid = COALESCE(t.request_id, '')
+          JOIN turns kt ON kt.id = d.keep_id
+         WHERE t.id != d.keep_id
+    """)
+    conn.execute("CREATE INDEX temp.idx_remap ON remap(old_uuid)")
+    conn.execute("""
+        UPDATE tool_calls
+           SET message_uuid = (SELECT keep_uuid FROM remap
+                               WHERE old_uuid = tool_calls.message_uuid)
+         WHERE message_uuid IN (SELECT old_uuid FROM remap)
+    """)
+    conn.execute("DELETE FROM turns WHERE message_uuid IN (SELECT old_uuid FROM remap)")
+    conn.execute("DROP TABLE dupe")
+    conn.execute("DROP TABLE gsum")
+    conn.execute("DROP TABLE remap")
+    conn.execute("PRAGMA user_version = 1")
+    conn.execute("COMMIT")
 
 
 def connect():
@@ -312,8 +397,55 @@ def _insert_row(conn, table, row):
 
 
 def upsert_turn(conn, turn):
-    """Insert a turn dict. Idempotent via UNIQUE(message_uuid)."""
-    _insert_row(conn, "turns", turn)
+    """Insert/refresh the ONE row for a billed API response.
+
+    Idempotent via UNIQUE(message_uuid). Two extra duties beyond a plain
+    insert, both consequences of "canonical row = LAST JSONL line of the
+    (message_id, request_id) group":
+
+    1. Stale-canonical cleanup: if a backfill ran while a multi-line
+       response was still being streamed to disk, an earlier line became
+       the canonical row. Delete rows for the same (message_id,
+       request_id) under a different message_uuid and remap their
+       tool_calls to the new canonical uuid.
+    2. Upsert instead of ignore: a re-scan of the now-complete response
+       carries the final usage tally + summed content stats, so update in
+       place. duration_ms is preserved (the post-pass fills it and the
+       merged row never carries one).
+    """
+    if turn.get("message_id"):
+        stale = [
+            r[0] for r in conn.execute(
+                "SELECT message_uuid FROM turns"
+                " WHERE message_id = ?"
+                "   AND COALESCE(request_id, '') = COALESCE(?, '')"
+                "   AND message_uuid != ?",
+                (turn["message_id"], turn.get("request_id"), turn["message_uuid"]),
+            )
+        ]
+        if stale:
+            qmarks = ", ".join("?" * len(stale))
+            conn.execute(
+                f"UPDATE tool_calls SET message_uuid = ? WHERE message_uuid IN ({qmarks})",
+                [turn["message_uuid"]] + stale,
+            )
+            conn.execute(f"DELETE FROM turns WHERE message_uuid IN ({qmarks})", stale)
+
+    cols = list(turn.keys())
+    placeholders = ", ".join("?" * len(cols))
+    col_list = ", ".join(cols)
+    update_cols = [c for c in cols if c not in ("message_uuid", "duration_ms")]
+    set_list = ", ".join(f"{c} = excluded.{c}" for c in update_cols)
+    # The WHERE keeps identical re-scans free (no write, no txn churn).
+    conn.execute(
+        f"INSERT INTO turns ({col_list}) VALUES ({placeholders})"
+        f" ON CONFLICT(message_uuid) DO UPDATE SET {set_list}"
+        f" WHERE turns.output_tokens IS NOT excluded.output_tokens"
+        f"    OR turns.num_tool_uses IS NOT excluded.num_tool_uses"
+        f"    OR turns.text_chars IS NOT excluded.text_chars"
+        f"    OR turns.stop_reason IS NOT excluded.stop_reason",
+        tuple(turn[c] for c in cols),
+    )
 
 
 def upsert_tool_call(conn, row):

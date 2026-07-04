@@ -4,8 +4,9 @@ Backfill every granular row type from Claude Code's local session logs.
 Scans every `~/.claude/projects/*/*.jsonl` (and also `~/.claude/sessions/*.jsonl`
 if present) and emits rows into six tables:
 
-    turns         ← assistant messages (w/ content stats + thinking/text/tool
-                    block counts + stop_reason + iterations + web_search/fetch)
+    turns         ← ONE row per billed API response (w/ content stats +
+                    thinking/text/tool block counts + stop_reason +
+                    iterations + web_search/fetch)
     tool_calls    ← one per `tool_use` block inside each assistant turn
     tool_results  ← one per `tool_result` block inside user turns
     user_prompts  ← one per `user` event (real prompt or tool_result wrapper)
@@ -15,6 +16,20 @@ if present) and emits rows into six tables:
 
 All inserts are idempotent via UNIQUE keys. Re-running is safe and is the
 expected way to catch up incrementally (use --since).
+
+Dedupe invariant (the one sharp edge of the JSONL format): Claude Code
+writes one `assistant` line PER CONTENT BLOCK, so a single billed API
+response (one `message.id` + `requestId`) spans multiple contiguous lines,
+each carrying a copy of the `usage` object. On current CC versions the
+copies are identical; on older versions (≤ ~2.1.96) they're a running
+tally where only the LAST line holds the final billed counts. Either way,
+summing usage per line double-counts (~2.1–2.6× measured). Anthropic's own
+Agent SDK docs say to dedupe by message id, and ccusage/tokmon both key on
+(message.id, requestId). We therefore merge each group into ONE turns row:
+usage/stop_reason/uuid/ts from the last line (system.turn_duration also
+parents the last line, so the duration join is preserved), content-block
+stats summed across the group's lines, tool_calls attached to that
+canonical uuid.
 
 After the row-level pass, a post-pass joins `system.turn_duration` events to
 their parent turns and fills `turns.duration_ms`.
@@ -356,6 +371,53 @@ def _dispatch(entry, source_file, account="primary", host="mac"):
     return _extract_event(entry, source_file)
 
 
+# Content-stat fields summed across a message's lines when merging (each
+# line carries exactly one content block; everything else is last-wins).
+_TURN_SUM_FIELDS = (
+    "num_thinking_blocks", "thinking_chars",
+    "num_text_blocks", "text_chars", "num_tool_uses",
+)
+
+
+class _TurnMerger:
+    """Collapse contiguous assistant lines of one API response into one turn.
+
+    Feed it per-line (turn, tool_rows) extractions; it flushes the merged
+    turn (+ its tool_calls remapped to the canonical last-line uuid) every
+    time the (message_id, request_id) key changes, and on flush() at EOF.
+    """
+
+    def __init__(self, emit):
+        self._emit = emit          # callback(table, row)
+        self._key = None
+        self._turn = None
+        self._tools = []
+
+    def add(self, turn, tool_rows):
+        key = (turn["message_id"] or turn["message_uuid"],
+               turn["request_id"] or "")
+        if key == self._key:
+            # Later line of the same response: last-wins for usage/stop/uuid
+            # (final tally on old running-tally versions, identical copy on
+            # new ones), sum the per-block content stats.
+            for f in _TURN_SUM_FIELDS:
+                turn[f] = (self._turn.get(f) or 0) + (turn.get(f) or 0)
+            self._turn = turn
+            self._tools.extend(tool_rows)
+        else:
+            self.flush()
+            self._key, self._turn, self._tools = key, turn, list(tool_rows)
+
+    def flush(self):
+        if self._turn is None:
+            return
+        self._emit("turns", self._turn)
+        for row in self._tools:
+            row["message_uuid"] = self._turn["message_uuid"]
+            self._emit("tool_calls", row)
+        self._key, self._turn, self._tools = None, None, []
+
+
 # ------------------------------------------------------------------
 # main backfill loop
 # ------------------------------------------------------------------
@@ -385,10 +447,23 @@ def backfill(since=None, verbose=True):
     # lock held for short bursts so the widget / launchd snapshot can
     # interleave reads between batches without waiting minutes.
     BATCH_ROWS = 2000
-    rows_in_txn = 0
+    txn = {"rows": 0}
     conn.execute("BEGIN")
 
+    def _write(table, row):
+        counts[table] += 1
+        before = conn.total_changes
+        inserters[table](conn, row)
+        if conn.total_changes > before:
+            inserted[table] += 1
+        txn["rows"] += 1
+        if txn["rows"] >= BATCH_ROWS:
+            conn.execute("COMMIT")
+            conn.execute("BEGIN")
+            txn["rows"] = 0
+
     for i, (path, account, host) in enumerate(files, 1):
+        merger = _TurnMerger(_write)
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
@@ -401,17 +476,15 @@ def backfill(since=None, verbose=True):
                         continue
                     counts["entries"] += 1
                     rows = _dispatch(entry, path, account=account, host=host)
+                    if entry.get("type") == "assistant" and rows:
+                        # rows[0] is the turns row, the rest are tool_calls.
+                        # Multi-line responses merge on (message_id,
+                        # request_id) key changes inside the merger.
+                        merger.add(rows[0][1], [r for _, r in rows[1:]])
+                        continue
                     for table, row in rows:
-                        counts[table] += 1
-                        before = conn.total_changes
-                        inserters[table](conn, row)
-                        if conn.total_changes > before:
-                            inserted[table] += 1
-                        rows_in_txn += 1
-                        if rows_in_txn >= BATCH_ROWS:
-                            conn.execute("COMMIT")
-                            conn.execute("BEGIN")
-                            rows_in_txn = 0
+                        _write(table, row)
+            merger.flush()
         except Exception as e:
             if verbose:
                 print(f"  skip {path}: {e}")
@@ -423,55 +496,42 @@ def backfill(since=None, verbose=True):
 
     # Post-pass: fill turns.duration_ms from system.turn_duration events.
     #
-    # Performance: naively this UPDATE has a `WHERE duration_ms IS NULL`
-    # and runs the correlated subquery against every such row in the
-    # table. On a DB with months of history and tens of thousands of
-    # historical turns that never matched a duration event (older CC
-    # versions didn't emit them), that's an O(N) subquery-per-row scan
-    # that spins at 100% CPU for minutes on a `--since 10m` incremental
-    # backfill — which is absurd since those 10 minutes of new rows are
-    # all we're trying to join. Scope the UPDATE to the same time window
-    # we just ingested so the join only runs against rows that could
-    # plausibly have new matching events.
+    # Performance, two traps learned the hard way:
+    # 1. Scope `WHERE duration_ms IS NULL` — months of historical turns
+    #    never matched a duration event (older CC versions didn't emit
+    #    them), so an unscoped correlated subquery reruns per dead row on
+    #    every `--since 10m` incremental. The `message_uuid IN (…)` filter
+    #    limits candidates to turns that HAVE a matching event at all.
+    # 2. Force idx_events_parent in the subquery. Left to itself the
+    #    planner picks idx_events_type_ts (it "satisfies" the type filter
+    #    + ORDER BY ts) and scans every system event PER ROW — quadratic;
+    #    a full rescan spun >35 min at 100% CPU before this was pinned.
     if verbose:
         print("post-pass: joining system.turn_duration → turns.duration_ms …")
+    update_sql = """
+        UPDATE turns
+           SET duration_ms = (
+               SELECT e.duration_ms
+                 FROM events e INDEXED BY idx_events_parent
+                WHERE e.parent_uuid = turns.message_uuid
+                  AND e.type = 'system'
+                  AND e.subtype = 'turn_duration'
+                ORDER BY e.ts ASC
+                LIMIT 1
+           )
+         WHERE duration_ms IS NULL
+           AND message_uuid IN (
+               SELECT parent_uuid FROM events
+                WHERE type = 'system' AND subtype = 'turn_duration'
+           )
+    """
     if since is not None:
         since_iso = (
             datetime.fromtimestamp(time.time() - since, tz=timezone.utc).isoformat()
         )
-        update_sql = """
-            UPDATE turns
-               SET duration_ms = (
-                   SELECT e.duration_ms
-                     FROM events e
-                    WHERE e.type = 'system'
-                      AND e.subtype = 'turn_duration'
-                      AND e.parent_uuid = turns.message_uuid
-                    ORDER BY e.ts ASC
-                    LIMIT 1
-               )
-             WHERE duration_ms IS NULL
-               AND ts >= ?
-        """
-        updated = conn.execute(update_sql, (since_iso,)).rowcount
+        updated = conn.execute(update_sql + " AND ts >= ?", (since_iso,)).rowcount
     else:
-        # Full scan (no --since): accept the long post-pass. Users who run
-        # an unbounded rescan already expect it to take minutes.
-        updated = conn.execute(
-            """
-            UPDATE turns
-               SET duration_ms = (
-                   SELECT e.duration_ms
-                     FROM events e
-                    WHERE e.type = 'system'
-                      AND e.subtype = 'turn_duration'
-                      AND e.parent_uuid = turns.message_uuid
-                    ORDER BY e.ts ASC
-                    LIMIT 1
-               )
-             WHERE duration_ms IS NULL
-            """
-        ).rowcount
+        updated = conn.execute(update_sql).rowcount
     conn.commit()
 
     if verbose:

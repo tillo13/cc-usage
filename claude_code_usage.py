@@ -1348,7 +1348,11 @@ def _scan_session_file(path):
     Returns {session_id, project, turns, context_tokens, context_k, model}
     or None if the file has no assistant messages.
 
-    "Turns"     = assistant messages (not raw lines — user events don't count).
+    "Turns"     = billed API responses (not raw lines — one response spans
+                  multiple contiguous assistant lines sharing a message.id,
+                  each repeating the usage object, so we count a turn only
+                  when the (message.id, requestId) key changes; the last
+                  line of a group carries the final usage tally).
     "Context"   = the LAST assistant message's total prompt size
                   (cache_read + cache_creation + fresh input) — the number
                   that'll be re-sent on the next turn.
@@ -1361,6 +1365,25 @@ def _scan_session_file(path):
     session_cost = 0.0      # cumulative re-read floor cost across the session
     agent_turns = 0         # sidechain / subagent turns = workflow / ultracode fan-out
     agent_types = set()     # distinct agentType labels (Explore, general-purpose, …)
+    # Pending (not-yet-committed) response group: the last line of a group
+    # holds the final context size, so we commit a group's cost/count when
+    # the next group starts (or at EOF).
+    pend_key = None
+    pend_ctx = 0
+    pend_agent = False
+
+    def _commit_pending():
+        nonlocal turns, agent_turns, session_cost, last_ctx
+        if pend_key is None:
+            return
+        if pend_agent:
+            agent_turns += 1
+            return
+        turns += 1
+        if pend_ctx > 0:
+            last_ctx = pend_ctx
+            session_cost += pend_ctx * _OPUS_CACHE_READ_USD_PER_TOKEN
+
     try:
         with open(path, "rb") as fh:
             for raw in fh:
@@ -1381,18 +1404,21 @@ def _scan_session_file(path):
                     continue
                 if obj.get("type") != "assistant":
                     continue
+                msg = obj.get("message") or {}
+                key = (msg.get("id") or obj.get("uuid"), obj.get("requestId"))
+                if key != pend_key:
+                    _commit_pending()
+                    pend_key, pend_ctx, pend_agent = key, 0, False
                 # Sidechain (Task subagent) turns don't count toward the
                 # user-facing "my session is long" feeling — but they ARE the
                 # signature of workflow / ultracode fan-out, so we count them
                 # separately to flag which window is running agents.
                 at = obj.get("agentType")
                 if obj.get("isSidechain") or at:
-                    agent_turns += 1
+                    pend_agent = True
                     if at:
                         agent_types.add(at)
                     continue
-                turns += 1
-                msg = obj.get("message") or {}
                 usage = msg.get("usage") or {}
                 ctx = (
                     (usage.get("cache_read_input_tokens") or 0)
@@ -1400,8 +1426,7 @@ def _scan_session_file(path):
                     + (usage.get("input_tokens") or 0)
                 )
                 if ctx > 0:
-                    last_ctx = ctx
-                    session_cost += ctx * _OPUS_CACHE_READ_USD_PER_TOKEN
+                    pend_ctx = ctx
                 model = msg.get("model")
                 if model:
                     last_model = model
@@ -1409,6 +1434,7 @@ def _scan_session_file(path):
                     project_cwd = obj.get("cwd")
                 if session_id is None:
                     session_id = obj.get("sessionId")
+        _commit_pending()
     except OSError:
         return None
 
