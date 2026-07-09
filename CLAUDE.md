@@ -252,15 +252,27 @@ fresh, so the bands are aggressive on purpose:
   ≥65% fill   → underlined white + "⚠ HANDOFF" flag (last comfortable
                 handoff window before turns get expensive AND slow)
 
-Data source is `live_session_stats()` in `claude_code_usage.py`, which
-MUST scan BOTH project roots — `~/.claude/projects/` (primary account)
-AND `~/.claude-alt/projects/` (overflow account) — because each open
-Claude Code window writes only to the root matching its active account.
-A single-root scan misses half the live windows when both accounts are
-in use. Do not "simplify" this back to a single root.
+Data source is `live_session_stats()` in `claude_code_usage.py`. It
+considers three candidate roots — `~/.claude/projects/` (primary),
+`~/.claude-alt/projects/` (overflow), `~/.claude-rog/projects/` (ROG
+mirror) — but **dedupes them by resolved real path first**. On this
+machine `~/.claude-alt/projects` is a **symlink to `~/.claude/projects`**
+(the two config homes share ONE physical projects dir; the account is
+distinguished only by each live process's `CLAUDE_CONFIG_DIR`, never by
+the file's path). Scanning both roots therefore listed — and counted —
+every open window TWICE: the phantom-double-window bug (fixed 2026-07-09).
+The realpath dedup collapses the symlinked pair to one scan → one entry
+per open window. Keep the dedup, NOT a hardcoded single root: if the
+homes ever get separate projects dirs again they resolve differently and
+both get scanned. The old comment here ("each account writes only to its
+own root, single-root scan misses half the windows") was the stale
+premise that caused the double-count — it was never true post-symlink.
 
-Sessions are keyed by `(root_name, project_dir)` so the same project
-open under both accounts surfaces as two distinct windows.
+The window list is a projection of live foreground `claude` processes
+(`ps` stat `+`, one entry per PID via `_live_claude_project_dirs` +
+`_claim_transcripts`), so a closed/ctrl-c'd window drops off immediately
+— no process, no window. Ghost filtering + realpath dedup together
+guarantee: shown windows == currently-open terminals, once each.
 
 `live_session_stats()` ALSO scans a third root — `~/.claude-rog/projects/`
 (the ROG mirror, see below) — tagged `host="rog"` and labeled

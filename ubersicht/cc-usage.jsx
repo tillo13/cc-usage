@@ -344,12 +344,17 @@ export const className = `
     letter-spacing: -0.005em;
   }
   .winName {
-    color: #B8C8E0;
+    color: #B8C8E0;              /* primary account (~/.claude) — calm blue */
     font-weight: 600;
     max-width: 120px;
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  /* overflow account (~/.claude-alt, the Pro spare) — red, so the one alt
+     window in a strip of primary ones is instantly distinguishable. Red is
+     otherwise unused in this widget (warnings are amber/white), so it carries
+     no danger connotation here — it means "this window is on the OTHER account". */
+  .winName.winAlt { color: #FF6B5C; }
   .winBar {
     display: inline-block;
     position: relative;
@@ -891,7 +896,7 @@ export const render = ({ output, error }) => {
           {winSorted.map((s, i) => (
             <span key={s.session_id || i} className="win">
               {i > 0 && <span className="winRule" />}
-              <span className="winName">{s.project || "?"}</span>
+              <span className={"winName" + (s.account === "overflow" ? " winAlt" : "")}>{s.project || "?"}</span>
               <span className="winBar">
                 <span
                   className={"winBarFill " + (s._cls === "crit" ? "bgCrit" : s._cls === "warn" ? "bgWarn" : "bgGood")}

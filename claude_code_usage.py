@@ -1629,8 +1629,9 @@ def _claim_transcripts(files, starts):
     """Map each live `claude` process to the ONE transcript it's driving.
 
     `files`  : [(mtime, path, host, birthtime), ...] candidates in one dir.
-    `starts` : [start_epoch | None, ...] one per live claude process in that
-               dir (from _live_claude_project_dirs).
+    `starts` : [(start_epoch | None, account), ...] one per live claude process
+               in that dir (from _live_claude_project_dirs), where account is
+               "primary" | "overflow".
 
     A freshly launched claude creates its session JSONL within seconds of the
     process start (observed Δ 3–50s), so the file born just after `start` is
@@ -1638,16 +1639,19 @@ def _claim_transcripts(files, starts):
     (birthtime predates the launch); for those we fall back to the freshest
     file written since the process started. N processes claim N distinct files.
 
+    Returns [(file_tuple, account), ...] so the caller can tag each surfaced
+    window with the account whose process is driving it.
+
     This is the fix for "stale windows": a window that was closed has no
     process, so its transcript is never claimed and drops off the widget on
     the next render — instead of lingering because its frozen mtime happened to
     be the newest in the dir (the old top-N-by-mtime heuristic's failure mode).
     """
     pool = list(files)
-    usable = sorted(s for s in starts if s is not None)
-    n_unknown = sum(1 for s in starts if s is None)
+    usable = sorted((s for s in starts if s[0] is not None), key=lambda s: s[0])
+    unknown = [s for s in starts if s[0] is None]
     claimed = []
-    for st in usable:
+    for st, acct in usable:
         born_after = [f for f in pool
                       if f[3] is not None and -10 <= f[3] - st <= 180]
         if born_after:
@@ -1658,13 +1662,14 @@ def _claim_transcripts(files, starts):
         if pick is None and pool:
             pick = max(pool, key=lambda f: f[0])  # last resort: freshest
         if pick is not None:
-            claimed.append(pick)
+            claimed.append((pick, acct))
             pool.remove(pick)
     # Processes whose start time couldn't be parsed: fall back to the freshest
     # remaining transcripts (the old top-N-by-mtime behavior) for those slots.
-    if n_unknown and pool:
+    if unknown and pool:
         pool.sort(key=lambda f: -f[0])
-        claimed.extend(pool[:n_unknown])
+        for f, (_, acct) in zip(pool, unknown):
+            claimed.append((f, acct))
     return claimed
 
 
@@ -1750,6 +1755,12 @@ def _live_claude_project_dirs():
         _save_lsof_blocklist({})
         return {}
 
+    # Which account is each open window on? The transcript file can't tell us —
+    # both config homes write to the same (symlinked) projects dir — so the ONLY
+    # signal is the live process's CLAUDE_CONFIG_DIR env var. "overflow" iff it
+    # points at ~/.claude-alt; unset / ~/.claude ⇒ "primary".
+    pid_account = _claude_accounts_for_pids(pids)
+
     import time
     blocked = _load_lsof_blocklist(set(pids))
     to_query = [p for p in pids if p not in blocked]
@@ -1766,10 +1777,40 @@ def _live_claude_project_dirs():
                 blocked[pid] = now
                 continue
             encoded = cwd.replace("/", "-").replace("_", "-")
-            dirs.setdefault(encoded, []).append(pid_start.get(pid))
+            dirs.setdefault(encoded, []).append(
+                (pid_start.get(pid), pid_account.get(pid, "primary")))
 
     _save_lsof_blocklist(blocked)
     return dirs
+
+
+def _claude_accounts_for_pids(pids):
+    """{pid: "primary"|"overflow"} from each pid's CLAUDE_CONFIG_DIR env.
+
+    One `ps eww` sweep dumps each process's environment in the command column
+    (own-user procs only, which these are). A pid whose env points at
+    ~/.claude-alt is the overflow (Pro) account; anything else — unset or the
+    default ~/.claude — is primary. Falls back to all-"primary" if ps fails.
+    """
+    out = {}
+    if not pids:
+        return out
+    try:
+        raw = subprocess.run(
+            ["ps", "eww", "-o", "pid=,command="] + [str(p) for p in pids],
+            capture_output=True, text=True, errors="replace", timeout=3,
+        ).stdout
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return {p: "primary" for p in pids}
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid = line.split(None, 1)[0]
+        out[pid] = "overflow" if ".claude-alt" in line and "CLAUDE_CONFIG_DIR=" in line else "primary"
+    for p in pids:
+        out.setdefault(p, "primary")
+    return out
 
 
 def live_session_stats(window_min=20, max_sessions=None, path_override=None):
@@ -1812,21 +1853,39 @@ def live_session_stats(window_min=20, max_sessions=None, path_override=None):
         return [stats]
 
     cutoff = now - window_min * 60
-    # Scan BOTH account roots — primary (~/.claude/projects) and overflow
-    # (~/.claude-alt/projects). Each open Claude Code window writes only to
-    # its own root, so a single-root scan misses half of the user's live
-    # sessions when both accounts are in use.
+    # Candidate account roots. IMPORTANT: ~/.claude-alt/projects is a SYMLINK to
+    # ~/.claude/projects — the two config homes share ONE physical projects dir,
+    # so both the primary and overflow accounts write their transcripts here.
+    # A file's path therefore says nothing about which account owns it (only the
+    # live process's CLAUDE_CONFIG_DIR does). Scanning both roots would list —
+    # and count — every open window TWICE (once per symlinked path), which is the
+    # phantom-double-window bug. We dedupe by RESOLVED real path below so each
+    # physical dir is scanned exactly once → one entry per open window. Dedup (not
+    # a hardcoded single root) keeps this correct if the homes ever get separate
+    # projects dirs again — then both resolve differently and both get scanned.
     # (root, host) — host "mac" gets ps/lsof liveness; host "rog" is the local
     # mirror of the ROG box's transcripts (rsync'd by scripts/mirror_rog_claude.sh).
     # We can't ps a remote box, so ROG sessions use mtime-only liveness with a
     # wider cutoff to absorb the 15-min mirror lag. Reading the local mirror —
     # never the SMB mount — keeps the widget render path stall-proof.
-    project_roots = [
+    candidate_roots = [
         (Path.home() / ".claude" / "projects", "mac"),
         (Path.home() / ".claude-alt" / "projects", "mac"),
         (Path.home() / ".claude-rog" / "projects", "rog"),
     ]
-    project_roots = [(r, h) for r, h in project_roots if r.exists()]
+    project_roots = []
+    seen_real = set()
+    for r, h in candidate_roots:
+        if not r.exists():
+            continue
+        try:
+            key = r.resolve()
+        except OSError:
+            key = r
+        if key in seen_real:
+            continue  # symlink to an already-scanned dir — don't double-count
+        seen_real.add(key)
+        project_roots.append((r, h))
     if not project_roots:
         return []
     rog_cutoff = now - max(window_min, 25) * 60   # mirror lag (~15m) + a little slack
@@ -1870,26 +1929,30 @@ def live_session_stats(window_min=20, max_sessions=None, path_override=None):
                     continue  # fallback path: no live signal, fall back to mtime
             by_project.setdefault((host, proj), []).append((mt, f, host, bt))
 
+    # candidates: [(file_tuple, account), ...] — account tags which config home's
+    # live process is driving the window (primary vs overflow), for the widget's
+    # per-window account color. ROG + the ps-failed fallback default to primary.
     candidates = []
     for (host, proj), files in by_project.items():
         if host == "rog":
             files.sort(key=lambda x: -x[0])  # no ps signal; mtime-pruned already
-            candidates.extend(files)
+            candidates.extend((f, "primary") for f in files)  # ROG shares primary quota
         elif live_starts:
             # One transcript per live process, matched by start ↔ birthtime.
             candidates.extend(_claim_transcripts(files, live_starts.get(proj, [])))
         else:
             files.sort(key=lambda x: -x[0])  # ps/lsof failed — mtime fallback
-            candidates.extend(files)
+            candidates.extend((f, "primary") for f in files)
 
     if not candidates:
         return []
 
     results = []
-    for mtime, path, host, _bt in candidates:
+    for (mtime, path, host, _bt), acct in candidates:
         stats = _scan_session_file(path)
         if not stats:
             continue
+        stats["account"] = acct  # "primary" | "overflow" — drives the widget color
         if host == "rog":
             # Label ROG windows distinctly: "ROG/<last path segment>". The cwd
             # is a Windows path (C:\local\dos_bros) — take the trailing segment.
