@@ -194,6 +194,13 @@ def _mac_health_snapshot():
             {"name": n[:28], "pct": round(p, 1)}
             for (p, n) in rows[:8]
         ]
+        # WindowServer called out by name (2026-08-19). It is allowlisted in
+        # the cleaner and no run reduces it, so it never shows as an
+        # actionable "top offender" — but on a multi-display Retina setup it
+        # is routinely the largest single consumer. Measured that day: 34-62%
+        # while the cleaner had a route to none of the hot processes.
+        out["windowserver_pct"] = round(
+            max((p for (p, n) in rows if n == "WindowServer"), default=0.0), 1)
     except Exception:
         out.setdefault("hot_count", 0)
         out.setdefault("top_pct", 0.0)
@@ -232,15 +239,60 @@ def _mac_health_snapshot():
             out["ram_total_gb"] = round(total_pages * page_size / (1024 ** 3), 1)
     except Exception:
         pass
+    # ── Signals added 2026-08-19, after /deep-search on the thresholds ──
+    # "RAM used %" is NOT a pressure signal on macOS: unused RAM is wasted RAM,
+    # so a high used-% is the normal state (greggant.com 2024-07-03; Apple
+    # defines pressure as free memory + swap RATE + compression). The kernel
+    # publishes its own verdict, so read that rather than inferring one.
+    try:
+        r = subprocess.run(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+                           capture_output=True, text=True, timeout=2)
+        out["pressure"] = int(r.stdout.strip())     # 1 normal / 2 warn / 4 critical
+    except Exception:
+        out["pressure"] = 1
+
+    # Reduce Transparency off means every panel/menu/sidebar does a live
+    # backdrop blur each frame — the one WindowServer lever that costs no
+    # open work, unlike a reboot (which does nothing: RSS measured flat at
+    # 216->225 MB over 2.5h, so this is steady-state compositing, not a leak).
+    try:
+        r = subprocess.run(["defaults", "read", "com.apple.universalaccess",
+                            "reduceTransparency"],
+                           capture_output=True, text=True, timeout=2)
+        out["transparency_off"] = r.stdout.strip() == "1"
+    except Exception:
+        out["transparency_off"] = False
+
+    # Idle background Chrome tabs, reclaimable without quitting Chrome.
+    # Selection is imported from the cleaner rather than reimplemented — one
+    # implementation, per DRY. Wrapped so a missing/moved mac_cleaner degrades
+    # to "no number" instead of breaking the widget.
+    try:
+        import sys as _sys
+        _mc = str(Path(__file__).resolve().parent.parent / "mac_cleaner")
+        if _mc not in _sys.path:
+            _sys.path.insert(0, _mc)
+        from cleaner_core import ps_full as _ps_full
+        import cleaner_report as _rpt
+        _reap, _ = _rpt.find_chrome_reapable(_ps_full())
+        out["chrome_reapable_gb"] = round(
+            sum(x["rss"] for x in _reap) / (1024 ** 3), 2)
+    except Exception:
+        out["chrome_reapable_gb"] = None
+
     # Severity band — JSX uses this to decide red/amber/normal.
     cores = out.get("cores", 8)
     load = out.get("load_1min", 0.0)
     top_pct = out.get("top_pct", 0.0)
-    if load >= cores * 4 or top_pct >= 200:
+    press = out.get("pressure", 1)
+    ws = out.get("windowserver_pct", 0.0)
+    # Kernel pressure outranks everything: it is the one signal that means the
+    # machine is genuinely short, rather than merely busy.
+    if press >= 4 or load >= cores * 4 or top_pct >= 200:
         out["band"] = "crit"
-    elif load >= cores * 2 or top_pct >= 100:
+    elif press >= 2 or load >= cores * 2 or top_pct >= 100:
         out["band"] = "warn"
-    elif load >= cores or top_pct >= 50:
+    elif load >= cores or top_pct >= 50 or ws >= 25.0:
         out["band"] = "elevated"
     else:
         out["band"] = "ok"

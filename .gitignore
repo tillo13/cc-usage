@@ -39,3 +39,9 @@ next_steps.md
 build/
 dist/
 *.egg
+
+# ─── local pre-edit safety copies ──────────────────────────────────────
+# Kept on disk deliberately (file-discipline: move, never delete), but they
+# are byte-duplicates of shipped files. Committing them to a public repo
+# publishes stale copies that someone later edits by mistake.
+ubersicht/_antiquated_widget_copies/
