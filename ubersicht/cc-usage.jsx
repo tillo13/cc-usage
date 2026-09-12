@@ -969,6 +969,8 @@ export const render = ({ output, error }) => {
       <StandbyRow
         standby={standby} primary={primary} overflow={overflow}
         active={active} d={d} standbyIsPrimary={standbyIsPrimary}
+        weekQuotaPct={weekQuotaPct} weekTimePct={weekTimePct}
+        weekDelta={weekDelta}
       />
       <OverflowNotice />
 

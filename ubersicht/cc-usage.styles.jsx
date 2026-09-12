@@ -191,6 +191,12 @@ export const className = `
   /* Semantic foreground colors — colorblind-safe.
      Crit is underlined so it is distinguishable by SHAPE, not just hue. */
   .good { color: #4AE3FF; font-weight: 700; }
+  /* Elevated — busy, not short. Its own rung between hint and num so it
+     stops wearing warn's alert amber (2026-09-12). Deliberately DIMMER than
+     .num rather than a different hue at the same brightness: the ladder has
+     to survive severe colour blindness, so luminance carries it (#A9BBD0 vs
+     #FFFFFF is a ~0.5 step) and weight separates it from .hint at 500. */
+  .elev { color: #A9BBD0; font-weight: 700; }
   .warn { color: #FFB800; font-weight: 800; }
   .crit {
     color: #FFFFFF;
@@ -214,6 +220,19 @@ export const className = `
   }
   .macBtn:hover { background: rgba(255, 184, 0, 0.18); }
   .macBtn:active { background: rgba(255, 184, 0, 0.32); }
+  /* Always mounted so it is there on a hunch, not only on a signal. Idle is
+     deliberately quiet — present, readable, ignorable — and full opacity
+     returns on hover so it never feels disabled. */
+  .macBtnIdle {
+    color: #6E7B86;
+    opacity: 0.45;
+    transition: opacity 120ms ease, background 100ms ease;
+  }
+  .macBtnIdle:hover { opacity: 1; }
+  /* Due = the band reached warn/crit, which after 2026-09-11 means kernel
+     memory pressure or one process genuinely eating cores — both things a run
+     can actually move. Reuses cc-nudge rather than adding a fourth blink. */
+  .macBtnDue { animation: cc-nudge 1.4s ease-in-out infinite; }
 
   /* Live-session inline wrapper — one per active session in the LIVE card. */
   .liveSess {

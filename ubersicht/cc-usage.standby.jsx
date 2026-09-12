@@ -22,7 +22,8 @@ import { OVERFLOW_RENEWAL_DATE, OVERFLOW_DOWNGRADE_SCHEDULED,
 // card (load / pressure / WindowServer / reapable tabs) and its
 // click-to-run cleaner button.
 export const StandbyRow = ({ standby, primary, overflow, active, d,
-                            standbyIsPrimary }) => {
+                            standbyIsPrimary, weekQuotaPct = 0,
+                            weekTimePct = 0, weekDelta = 0 }) => {
   if (!standby || !standby.session) return null
 
         const stbSess = standby.session || {}
@@ -212,9 +213,18 @@ export const StandbyRow = ({ standby, primary, overflow, active, d,
               const bandClass =
                 m.band === "crit" ? "crit"
                 : m.band === "warn" ? "warn"
-                : m.band === "elevated" ? "warn"
+                : m.band === "elevated" ? "elev"
                 : "num"
-              const showButton = m.band === "warn" || m.band === "crit"
+              // The cleaner button is ALWAYS offered — Andy runs it on a hunch as
+              // often as on a signal, and a button that only appears when the
+              // box is unhappy is a button you can't find when you want it.
+              // What the band changes is loudness, not presence: dim by
+              // default, pulsing when a run would actually do something —
+              // which after 2026-09-12 means kernel memory pressure and
+              // nothing else. See _severity_band in claude_code_usage.py:
+              // a CPU-spike gate on a decaying average flickered the pulse
+              // on and off every poll, always for processes a run can't touch.
+              const cleanerDue = m.band === "warn" || m.band === "crit"
               return (
                 <div className="card cardInline macCard">
                   <span className="lbl">mac</span>
@@ -223,7 +233,11 @@ export const StandbyRow = ({ standby, primary, overflow, active, d,
                     {m.cores != null && (
                       <span className="hint">/{m.cores}c</span>
                     )}
-                    {(m.band === "elevated" || m.band === "warn" || m.band === "crit") && [
+                    {/* hot_count at elevated was an actionable-looking field with
+                        no action behind it — it counts allowlisted processes
+                        (WindowServer, Terminal, claude), which no run reduces.
+                        Shown only at warn/crit now, where pressure is real. */}
+                    {(m.band === "warn" || m.band === "crit") && [
                       <span key="hd" className="dot">·</span>,
                       <span key="hh" className={m.hot_count >= 10 ? "warn" : "num"}>{m.hot_count} hot</span>,
                     ]}
@@ -277,21 +291,24 @@ export const StandbyRow = ({ standby, primary, overflow, active, d,
                         {m.chrome_reapable_gb.toFixed(1)}G
                       </span>,
                     ]}
-                    {showButton && [
-                      <span key="cd" className="dot">·</span>,
-                      <span
-                        key="cb"
-                        className={"macBtn " + (m.band === "crit" ? "crit" : "warn")}
-                        onClick={() => {
-                          try {
-                            run("$HOME/Desktop/code/_local_infrastructure/mac_cleaner/run_in_terminal.sh")
-                          } catch (e) { /* keep widget alive */ }
-                        }}
-                        title="Click to launch smart_mac_cleaner.py in a new Terminal tab"
-                      >
-                        ▶ run smart_mac_cleaner
-                      </span>,
-                    ]}
+                    <span className="dot">·</span>
+                    <span
+                      className={"macBtn "
+                        + (cleanerDue
+                            ? (m.band === "crit" ? "crit" : "warn") + " macBtnDue"
+                            : "macBtnIdle")}
+                      onClick={() => {
+                        try {
+                          run("$HOME/Desktop/code/_local_infrastructure/mac_cleaner/run_in_terminal.sh")
+                        } catch (e) { /* keep widget alive */ }
+                      }}
+                      title={cleanerDue
+                        ? "A run would help right now — " + m.band
+                        + ". Click to launch smart_mac_cleaner.py in a new Terminal tab."
+                        : "Nothing needs cleaning. Click to run smart_mac_cleaner.py anyway."}
+                    >
+                      ▶ run smart_mac_cleaner
+                    </span>
                   </span>
 
                   <div className="tip tipRight">
@@ -302,7 +319,10 @@ export const StandbyRow = ({ standby, primary, overflow, active, d,
                     </span>
                     <span className="tipKey">  / {m.cores} cores</span>{"\n"}
                     <span className="tipKey">band      </span>
-                    <span className={"tipVal " + bandClass}>{m.band}</span>{"\n"}
+                    <span className={"tipVal " + bandClass}>{m.band}</span>
+                    <span className="tipKey">
+                      {m.settling ? "  (just booted — load/top ignored)" : ""}
+                    </span>{"\n"}
                     <span className="tipKey">pressure  </span>
                     <span className={"tipVal " + (m.pressure >= 4 ? "crit" : m.pressure >= 2 ? "warn" : "")}>
                       {m.pressure >= 4 ? "critical" : m.pressure >= 2 ? "warn" : "normal"}
@@ -343,9 +363,15 @@ export const StandbyRow = ({ standby, primary, overflow, active, d,
                       "\n",
                     ])}
                     <span className="tipNote">
-                      load = work-queue depth (best signal). Above {m.cores} = busy,
-                      above {m.cores * 2} = sweating, above {m.cores * 4} = overwhelmed.
-                      {showButton ? "\n\nClick the ▶ button to fix." : ""}
+                      load = runnable threads. Above {m.cores} = busy — context, not a
+                      call to act: nothing the cleaner touches reduces it (Spotlight,
+                      WindowServer and claude are all allowlisted).
+                      {m.settling
+                        ? "\n\nJust booted — load and top proc are the login cascade, ignored until "
+                          + "the box settles."
+                        : cleanerDue
+                          ? "\n\nMemory pressure / a process eating cores — a run would help. Click ▶."
+                          : "\n\nNothing needs cleaning. ▶ runs it anyway."}
                     </span>
                   </div>
                 </div>

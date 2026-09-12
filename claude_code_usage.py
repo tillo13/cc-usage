@@ -139,6 +139,78 @@ def _parse_iso(ts):
     return datetime.fromisoformat(ts.replace("Z", "+00:00"))
 
 
+# Uptime under which load and top_pct are treated as boot noise rather than a
+# condition. 5 minutes: longer than the ~1-min load-average decay constant, and
+# long enough for the Spotlight/iCloud login cascade to stop dominating.
+BOOT_SETTLE_SEC = 300
+
+
+def _severity_band(out):
+    """Set out["band"] and out["settling"] from the vitals in `out`.
+
+    Split out from _mac_health_snapshot so it can be exercised with
+    synthetic vitals — a band that has never been watched go red is not
+    evidence that it ever will.
+    """
+    # Severity band — JSX uses this to decide red/amber/normal AND whether to
+    # offer the "run smart_mac_cleaner" button (showButton in the standby JSX).
+    #
+    # 2026-09-11 — two defects, one reboot. At T+2min the login cascade
+    # (Spotlight, cloudd, Übersicht, Claude, login items, all starting at once)
+    # put load at 53.96 on 8 cores = 6.75/core, which banded crit and painted
+    # the red cleaner button, while every signal that means anything read idle:
+    # pressure normal, 0 swapouts since boot, RAM 25%, disk 3% used. So:
+    #   · load and top_pct are ignored for the first BOOT_SETTLE_SEC. Load
+    #     averages decay over ~1 minute and the cascade runs longer than that,
+    #     and `ps %cpu` is itself a ~1-min decaying average, so a seconds-old
+    #     process reports a meaningless spike for the same reason.
+    #   · load can no longer reach warn or crit on its own at ANY uptime. It
+    #     counts runnable threads, and nothing a cleaner run does reduces it —
+    #     Spotlight, WindowServer and claude are all allowlisted. The watcher
+    #     dropped load as a trigger on 2026-09-04 (see _auto_should_act in
+    #     smart_mac_cleaner.py) and this band never got the memo, so the loose
+    #     gate was guarding the broad action (a full interactive run) while the
+    #     narrow gate guarded the safe subset. Backwards. Load still colours the
+    #     row as "elevated" — that is information, not a call to act.
+    # 2026-09-12 — top_pct follows load out of the warn/crit gate, for the
+    # same reason and then some. Measured over 80s of sampling: the gate was
+    # tripped twice by processes no run can touch (MTLCompilerService at
+    # 100%, then a Google Chrome Helper at 234% — Chrome is never quit and
+    # the renderer reaper takes idle ones only), and it FLICKERED, because
+    # `ps %cpu` is a ~1-min decaying average read on a 60s repoll: one real
+    # 2-second burst stays over the line for several polls, then falls off.
+    # A threshold on a decaying average cannot be stable at that cadence, so
+    # no value of the constant fixes it. Filtering row 0 through the cleaner's
+    # allowlist doesn't either — neither driver was allowlisted, and both were
+    # still untouchable. So top_pct now tops out at "elevated" (information),
+    # and kernel pressure is the sole warn/crit trigger. That also makes this
+    # band agree with _auto_should_act in smart_mac_cleaner.py, which had been
+    # logging "skip — quiet" all morning while this painted a pulsing button.
+    # What is left in warn/crit is what a run can actually move: kernel memory
+    # pressure.
+    cores = out.get("cores", 8)
+    load = out.get("load_1min", 0.0)
+    top_pct = out.get("top_pct", 0.0)
+    press = out.get("pressure", 1)
+    ws = out.get("windowserver_pct", 0.0)
+    up = out.get("uptime_sec")
+    settling = up is not None and up < BOOT_SETTLE_SEC
+    out["settling"] = settling
+    if settling:
+        load = top_pct = 0.0
+    # Kernel pressure outranks everything: it is the one signal that means the
+    # machine is genuinely short, rather than merely busy, and the one that is
+    # trustworthy at any uptime.
+    if press >= 4:
+        out["band"] = "crit"
+    elif press >= 2:
+        out["band"] = "warn"
+    elif load >= cores or top_pct >= 50 or ws >= 25.0:
+        out["band"] = "elevated"
+    else:
+        out["band"] = "ok"
+
+
 def _mac_health_snapshot():
     """Cheap Mac vitals for the widget (load avg, hot procs, top hog, RAM%).
 
@@ -280,22 +352,17 @@ def _mac_health_snapshot():
     except Exception:
         out["chrome_reapable_gb"] = None
 
-    # Severity band — JSX uses this to decide red/amber/normal.
-    cores = out.get("cores", 8)
-    load = out.get("load_1min", 0.0)
-    top_pct = out.get("top_pct", 0.0)
-    press = out.get("pressure", 1)
-    ws = out.get("windowserver_pct", 0.0)
-    # Kernel pressure outranks everything: it is the one signal that means the
-    # machine is genuinely short, rather than merely busy.
-    if press >= 4 or load >= cores * 4 or top_pct >= 200:
-        out["band"] = "crit"
-    elif press >= 2 or load >= cores * 2 or top_pct >= 100:
-        out["band"] = "warn"
-    elif load >= cores or top_pct >= 50 or ws >= 25.0:
-        out["band"] = "elevated"
-    else:
-        out["band"] = "ok"
+    # Seconds since boot. Imported from the cleaner rather than reimplemented,
+    # same DRY rule as chrome_reapable_gb above (the sys.path insert there has
+    # already run). None on failure, and None is read below as "not settling" —
+    # a broken import must never silently mute the band forever.
+    try:
+        from cleaner_core import uptime_sec as _uptime_sec
+        out["uptime_sec"] = round(_uptime_sec(), 1)
+    except Exception:
+        out["uptime_sec"] = None
+
+    _severity_band(out)
     return out
 
 
