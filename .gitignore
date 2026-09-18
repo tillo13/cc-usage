@@ -12,6 +12,11 @@ data/.backfill.lock
 # PIDs that hung lsof (stuck remote mounts etc.) — GC'd against live PIDs.
 data/.lsof_blocklist
 
+# Handoff button: per-transcript scan cache + click log (handoff.py).
+data/.handoff_scan_cache.json
+data/handoff.log
+data/.handoff.lock
+
 # ─── python caches ─────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]

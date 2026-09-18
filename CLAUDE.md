@@ -28,6 +28,9 @@ A self-contained stack that
     - `cc-usage --widget-json` — compact JSON for the Übersicht widget
     - `cc-usage --snapshot-only` — silent mode for the 15-min launchd agent
     - `cc-usage --validate` — Max plan drift check
+- `handoff.py` — the WINDOWS strip's one-click handoff: idle detection
+  (`scan` / `evaluate` / `annotate`, render path) and `launch` (click path).
+  See "Active windows banner" below.
 - `claude_usage_db.py` — SQLite schema + helpers. Six tables; DB path
   resolves to `data/claude_usage.db` sibling of this file.
 - `claude_usage_backfill.py` — idempotent JSONL parser. Walks
@@ -243,14 +246,37 @@ Claude Code window with a mini fill bar against the 1M context ceiling
 always-visible "which open window is about to compact" readout so they
 can `/handoff` on their own terms instead of letting auto-compact fire.
 
-Thresholds (1M-anchored, NOT the 280k $/reply bands used by the row-2
-LIVE card — two different questions). Tuned to cost-per-turn, not
-auto-compact: at >150k context you're already paying ~5× per turn vs
-fresh, so the bands are aggressive on purpose:
-  <40% fill   → neutral cyan
-  ≥40% fill   → amber (start thinking — cost-per-turn climbing)
-  ≥65% fill   → underlined white + "⚠ HANDOFF" flag (last comfortable
-                handoff window before turns get expensive AND slow)
+Thresholds (changed 2026-09-18): ONE handoff number,
+`handoff.HANDOFF_CTX_TOKENS` = 180k, shared by the context-compaction skill,
+the LIVE card's HANDOFF band (`_classify_session`) and this strip. The bar
+still draws against 1M, but its color is the session's band: amber from 180k,
+underlined white from 280k. (Until 2026-09-18 the strip flagged at 65% of 1M,
+i.e. 650k, while its own rationale said cost climbs past 150k. That week the
+fattest windows ran to 963k.)
+
+Past 180k each Mac window shows `HandoffChip` (`ubersicht/cc-usage.handoff.jsx`):
+  busy  → the reason as text ("busy: working", "busy: 2 bg tasks", "busy:
+          waiting on a tool", "busy: input queued"). No button.
+  idle  → a pulsing "▶ handoff" button. Click runs `handoff.py launch`:
+          re-checks idle, writes a baton to ~/.claude/handoffs/ (opening
+          request + conversation tail, tool output stripped, loops to
+          re-arm), opens a new Terminal window in the same project on the
+          same account (`claude` / `claude2` alias), laid exactly over the
+          old window with the old tab's profile (bounds + current settings,
+          so the replacement is obvious among 4-5 windows; one launch at a
+          time via flock on data/.handoff.lock), waits on state for the
+          new claude to appear on that tty, then SIGTERMs the old claude by
+          pid. The old tab and scrollback stay; `claude --resume` restores it.
+Idle = last reply ended (not `tool_use`), no user/notification entry after
+it, no background Bash / async Agent / Monitor still out (a task is done
+only when a `<task-notification>` WITH `<status>` names it; Monitor events
+carry no status), nothing queued after the last reply. CronCreate /
+ScheduleWakeup loops don't block: they're session-only, so the baton
+carries them and the new session re-arms them (the old one's die with it).
+The scan runs only for windows over 180k and is cached by (size, mtime) in
+`data/.handoff_scan_cache.json`. Clicks log to `data/handoff.log`; refusals
+also pop a macOS notification. ROG windows have no pid, so they keep a plain
+"⚠ handoff" flag. Tests: `tests/test_handoff.py` (plain python, FDA venv).
 
 Data source is `live_session_stats()` in `claude_code_usage.py`. It
 considers three candidate roots — `~/.claude/projects/` (primary),

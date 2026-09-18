@@ -61,6 +61,7 @@ from zoneinfo import ZoneInfo
 # cron, or a `cd elsewhere && python3 /path/to/claude_code_usage.py`).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_usage_db as dbmod  # noqa: E402
+import handoff  # noqa: E402
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 USER_AGENT = "claude-cli/2.1.101 (external, cli)"
@@ -1422,9 +1423,13 @@ def _classify_session(turns, context_k):
 
     Thresholds map directly to $/reply at Opus cache-read pricing:
         <60k   → <$0.03/reply   → FRESH   (good)    · cheap, keep going
-        60–150 → $0.03–0.075    → NORMAL  (hint)    · typical median session
-        150–280→ $0.075–0.14    → HANDOFF (warn)    · getting expensive, consider
+        60–180 → $0.03–0.09     → NORMAL  (hint)    · typical median session
+        180–280→ $0.09–0.14     → HANDOFF (warn)    · the ▶ handoff button shows
         280+   → >$0.14/reply   → COMPACT (crit)    · every reply costs real $
+
+    The HANDOFF edge is handoff.HANDOFF_CTX_TOKENS (was 150k until 2026-09-18),
+    shared with the context-compaction skill's 180k and the widget button so
+    there is one handoff number, not three.
 
     Distribution context from the 7-day study: p50=118k (NORMAL mid),
     p95=424k (deep COMPACT), p99=594k (very deep COMPACT). The bands are
@@ -1434,7 +1439,7 @@ def _classify_session(turns, context_k):
     c = context_k or 0
     if c >= 280:
         return "crit", "COMPACT"
-    if c >= 150:
+    if c >= handoff.HANDOFF_CTX_TOKENS / 1000:
         return "warn", "HANDOFF"
     if c >= 60:
         return "hint", "NORMAL"
@@ -1748,9 +1753,9 @@ def _claim_transcripts(files, starts):
     """Map each live `claude` process to the ONE transcript it's driving.
 
     `files`  : [(mtime, path, host, birthtime), ...] candidates in one dir.
-    `starts` : [(start_epoch | None, account), ...] one per live claude process
-               in that dir (from _live_claude_project_dirs), where account is
-               "primary" | "overflow".
+    `starts` : [(start_epoch | None, account, pid), ...] one per live claude
+               process in that dir (from _live_claude_project_dirs), where
+               account is "primary" | "overflow".
 
     A freshly launched claude creates its session JSONL within seconds of the
     process start (observed Δ 3–50s), so the file born just after `start` is
@@ -1758,8 +1763,9 @@ def _claim_transcripts(files, starts):
     (birthtime predates the launch); for those we fall back to the freshest
     file written since the process started. N processes claim N distinct files.
 
-    Returns [(file_tuple, account), ...] so the caller can tag each surfaced
-    window with the account whose process is driving it.
+    Returns [(file_tuple, account, pid, start_epoch), ...] so the caller can tag
+    each surfaced window with the account and process driving it (the pid and
+    start are what the handoff button needs to end exactly that process).
 
     This is the fix for "stale windows": a window that was closed has no
     process, so its transcript is never claimed and drops off the widget on
@@ -1770,7 +1776,7 @@ def _claim_transcripts(files, starts):
     usable = sorted((s for s in starts if s[0] is not None), key=lambda s: s[0])
     unknown = [s for s in starts if s[0] is None]
     claimed = []
-    for st, acct in usable:
+    for st, acct, pid in usable:
         born_after = [f for f in pool
                       if f[3] is not None and -10 <= f[3] - st <= 180]
         if born_after:
@@ -1781,21 +1787,21 @@ def _claim_transcripts(files, starts):
         if pick is None and pool:
             pick = max(pool, key=lambda f: f[0])  # last resort: freshest
         if pick is not None:
-            claimed.append((pick, acct))
+            claimed.append((pick, acct, pid, st))
             pool.remove(pick)
     # Processes whose start time couldn't be parsed: fall back to the freshest
     # remaining transcripts (the old top-N-by-mtime behavior) for those slots.
     if unknown and pool:
         pool.sort(key=lambda f: -f[0])
-        for f, (_, acct) in zip(pool, unknown):
-            claimed.append((f, acct))
+        for f, (_, acct, pid) in zip(pool, unknown):
+            claimed.append((f, acct, pid, None))
     return claimed
 
 
 def _live_claude_project_dirs():
-    """Return {project_dir_name: [process_start_epoch | None, ...]} for every
-    project where a `claude` CLI process is currently running (one list entry
-    per live process, so len() is the live window count for that dir).
+    """Return {project_dir_name: [(start_epoch | None, account, pid), ...]} for
+    every project where a `claude` CLI process is currently running (one list
+    entry per live process, so len() is the live window count for that dir).
 
     Used to filter out "ghost sessions" — JSONL files whose mtime is still
     within the activity window because the file was last touched a few
@@ -1897,7 +1903,7 @@ def _live_claude_project_dirs():
                 continue
             encoded = cwd.replace("/", "-").replace("_", "-")
             dirs.setdefault(encoded, []).append(
-                (pid_start.get(pid), pid_account.get(pid, "primary")))
+                (pid_start.get(pid), pid_account.get(pid, "primary"), pid))
 
     _save_lsof_blocklist(blocked)
     return dirs
@@ -2048,30 +2054,35 @@ def live_session_stats(window_min=20, max_sessions=None, path_override=None):
                     continue  # fallback path: no live signal, fall back to mtime
             by_project.setdefault((host, proj), []).append((mt, f, host, bt))
 
-    # candidates: [(file_tuple, account), ...] — account tags which config home's
-    # live process is driving the window (primary vs overflow), for the widget's
-    # per-window account color. ROG + the ps-failed fallback default to primary.
+    # candidates: [(file_tuple, account, pid, start), ...] — account tags which
+    # config home's live process is driving the window (primary vs overflow),
+    # for the widget's per-window account color. ROG + the ps-failed fallback
+    # default to primary and carry no pid (so they never get a handoff button).
     candidates = []
     for (host, proj), files in by_project.items():
         if host == "rog":
             files.sort(key=lambda x: -x[0])  # no ps signal; mtime-pruned already
-            candidates.extend((f, "primary") for f in files)  # ROG shares primary quota
+            candidates.extend((f, "primary", None, None) for f in files)  # ROG shares primary quota
         elif live_starts:
             # One transcript per live process, matched by start ↔ birthtime.
             candidates.extend(_claim_transcripts(files, live_starts.get(proj, [])))
         else:
             files.sort(key=lambda x: -x[0])  # ps/lsof failed — mtime fallback
-            candidates.extend((f, "primary") for f in files)
+            candidates.extend((f, "primary", None, None) for f in files)
 
     if not candidates:
         return []
 
     results = []
-    for (mtime, path, host, _bt), acct in candidates:
+    for (mtime, path, host, _bt), acct, pid, proc_start in candidates:
         stats = _scan_session_file(path)
         if not stats:
             continue
         stats["account"] = acct  # "primary" | "overflow" — drives the widget color
+        stats["pid"] = pid
+        stats["transcript"] = str(path)
+        if host != "rog":
+            handoff.annotate(stats, path, pid, proc_start)
         if host == "rog":
             # Label ROG windows distinctly: "ROG/<last path segment>". The cwd
             # is a Windows path (C:\local\dos_bros) — take the trailing segment.

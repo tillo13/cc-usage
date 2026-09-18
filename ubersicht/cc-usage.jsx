@@ -66,6 +66,7 @@
 // shell commands (e.g. the macBtn that launches smart_mac_cleaner).
 import { run } from "uebersicht"
 import { StandbyRow, OverflowNotice } from "./cc-usage.standby.jsx"
+import { HandoffChip } from "./cc-usage.handoff.jsx"
 import { PYTHON_BIN, REPO_ROOT, OVERFLOW_RENEWAL_DATE,
          OVERFLOW_DOWNGRADE_SCHEDULED, renewalDaysLeft }
   from "./cc-usage.config.jsx"
@@ -301,21 +302,18 @@ export const render = ({ output, error }) => {
   const worst = liveSessions[0] || null            // drives the headline pill
 
   // ── windows strip (context fill of 1M context beta) ──
-  // Re-rank the active sessions by fill %, worst-first, and tag each one
-  // with a threshold class. These thresholds are tied to the 1M ceiling,
-  // not the 280k $/reply bands — two different questions, two different
-  // displays.
+  // Re-rank the active sessions by fill %, worst-first. The bar still draws
+  // against the 1M ceiling, but the color is the session's cost band, so the
+  // strip, the LIVE card and the handoff button share one threshold: warn
+  // from 180k (handoff.HANDOFF_CTX_TOKENS), crit from 280k. Until 2026-09-18
+  // the strip flagged at 65% of 1M (650k), long after cost had climbed.
   const CONTEXT_CAP = 1_000_000
   const winSorted = liveSessions
     .map((s) => {
       const ctx = s.context_tokens || 0
       const pct = (ctx / CONTEXT_CAP) * 100
-      // Tuned to cost-per-turn, not auto-compact. At ≥40% fill (400k ctx)
-      // cost-per-turn climbs noticeably; ≥65% (650k) is the last comfortable
-      // handoff window before things get expensive AND slow.
-      const cls = pct >= 65 ? "crit" : pct >= 40 ? "warn" : "good"
-      const flag = pct >= 65 ? "⚠ handoff" : null
-      return { ...s, _pct: pct, _cls: cls, _flag: flag }
+      const cls = s.band === "crit" ? "crit" : s.band === "warn" ? "warn" : "good"
+      return { ...s, _pct: pct, _cls: cls }
     })
     .sort((a, b) => b._pct - a._pct)
 
@@ -325,9 +323,9 @@ export const render = ({ output, error }) => {
       {/* ════════════════════════════════════════════════════════════
            ROW 0 — WINDOWS STRIP (context fill of 1M)
            Horizontal list of every currently-active Claude Code window
-           with a mini fill bar against the 1M context ceiling. Tells the
-           user which window is about to hit auto-compact so they can
-           /handoff on their own terms instead of letting the summary do it.
+           with a mini fill bar against the 1M context ceiling. Past 180k a
+           window gets a ▶ handoff button once it's idle, or its busy reason
+           while it isn't (HandoffChip, cc-usage.handoff.jsx).
          ════════════════════════════════════════════════════════════ */}
       {winSorted.length > 0 && (
         <div className="row winStrip">
@@ -354,7 +352,7 @@ export const render = ({ output, error }) => {
               {s.agents_active && (
                 <span className="winAgents" title={"workflow / subagent fan-out — " + s.agent_turns + " agent turns" + (s.agent_types && s.agent_types.length ? " (" + s.agent_types.join(", ") + ")" : "")}>⚙ {s.agent_turns}</span>
               )}
-              {s._flag && <span className={"winFlag " + s._cls}>{s._flag}</span>}
+              <HandoffChip s={s} />
             </span>
           ))}
         </div>
@@ -862,13 +860,13 @@ export const render = ({ output, error }) => {
                 sunk. A 500-turn / 60k session is cheap to continue; a
                 40-turn / 350k session is expensive.
                 {"\n"}  FRESH    &lt;60k ctx    &lt;$0.03/reply
-                {"\n"}  NORMAL   60–150k      $0.03–$0.075/reply
-                {"\n"}  HANDOFF  150–280k     $0.075–$0.14/reply
+                {"\n"}  NORMAL   60–180k      $0.03–$0.09/reply
+                {"\n"}  HANDOFF  180–280k     $0.09–$0.14/reply
                 {"\n"}  COMPACT  280k+        &gt;$0.14/reply  ← act
                 {"\n\n"}Costs assume Opus cache-read at $0.50/mtok. Each
                 reply pays this FLOOR just to re-read history; thinking,
                 new input, and tool output are extra on top.
-                {"\n\n"}Run /handoff → fresh window → /resume to reset.
+                {"\n\n"}Click ▶ handoff on the window's chip in the top strip (shows once it's idle).
               </span>
             </div>
           </div>,

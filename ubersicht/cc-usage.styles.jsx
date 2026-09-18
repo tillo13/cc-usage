@@ -212,6 +212,11 @@ export const className = `
 
   /* Click-to-run mac cleaner button — in row 2 when load is bad. */
   .macBtn {
+    /* The widget root is pointer-events: none (clicks pass through to the
+       desktop) and only .card opts back in. A button outside a card, like the
+       strip's ▶ handoff, must opt in itself or the click lands on the
+       wallpaper and macOS "reveal desktop" fires instead. */
+    pointer-events: auto;
     cursor: pointer;
     padding: 0 6px;
     border-radius: 3px;
