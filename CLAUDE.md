@@ -260,8 +260,11 @@ Past 180k each Mac window shows `HandoffChip` (`ubersicht/cc-usage.handoff.jsx`)
   idle  → a pulsing "▶ handoff" button. Click runs `handoff.py launch`:
           re-checks idle, writes a baton to ~/.claude/handoffs/ (opening
           request + conversation tail, tool output stripped, loops to
-          re-arm), opens a new Terminal window in the same project on the
-          same account (`claude` / `claude2` alias), laid exactly over the
+          re-arm, plus the instructions, so the argv prompt that Terminal
+          prints in the title is one short line), opens a new Terminal
+          window in the same project on the same account (`claude` /
+          `claude2` alias; `update_terminal_cwd` after the cd so the title
+          names the project, not ~/.zprofile's "code"), laid exactly over the
           old window with the old tab's profile (bounds + current settings,
           so the replacement is obvious among 4-5 windows; one launch at a
           time via flock on data/.handoff.lock), waits on state for the

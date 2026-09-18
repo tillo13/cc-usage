@@ -8,9 +8,9 @@ Click path: `handoff.py launch --pid PID --transcript PATH`
   1. re-checks idle against the transcript (state may have moved since render)
   2. writes a baton to ~/.claude/handoffs/: the opening request + conversation
      tail with tool output stripped, plus any loops to re-arm
-  3. opens a new Terminal window in the same project on the same account,
-     laid over the old window with its profile, started with a prompt that
-     points at the baton
+  3. opens a new Terminal window in the same project (titled with it) on the
+     same account, laid over the old window with its profile, started with a
+     one-line prompt that points at the baton, which carries the instructions
   4. once the new claude process is up, ends the old one by PID. The tab and
      its scrollback stay; `claude --resume` brings the old session back.
 
@@ -320,8 +320,14 @@ def write_baton(path, meta, loops, now=None):
         used += len(t)
     tail.reverse()
     first = next((t for r, t in msgs if r == "Andy"), "")
+    rearm = " Re-create the loops under 'Loops to re-arm' exactly as written." if loops else ""
     lines = [
         f"# Auto handoff: {meta['project']} ({meta['context_k']:.0f}k context)",
+        "",
+        f"You are picking up from a {meta['context_k']:.0f}k-context session in `{meta['cwd']}`, "
+        f"which has been ended. This file holds the opening request and the conversation tail "
+        f"with tool output stripped; the full transcript is linked below.{rearm} Then give a "
+        f"3-line status (what we were doing, where it stands, the next step) and wait.",
         "",
         f"- from session: `{meta['session_id']}`",
         f"- full transcript: `{path}` (grep it for specifics, never read it whole)",
@@ -421,16 +427,11 @@ def launch(pid, transcript):
     meta = {"project": stats.get("project") or cwd, "context_k": stats.get("context_k") or 0,
             "session_id": stats.get("session_id") or path.stem, "cwd": cwd, "account": account}
     baton = write_baton(path, meta, v["loops"])
-    rearm = (" Re-create the loops under 'Loops to re-arm' exactly as written."
-             if v["loops"] else "")
-    prompt = (f"Handoff from a {meta['context_k']:.0f}k-context session in this directory, "
-              f"which has been ended. Read {baton} first: it holds the opening request and "
-              f"the conversation tail with tool output stripped. The full transcript is {path}; "
-              f"grep it for specifics, never read it whole.{rearm} Then give me a 3-line status "
-              f"(what we were doing, where it stands, the next step) and wait.")
+    # Short on purpose: Terminal prints claude's arguments in the window title.
+    prompt = f"Handoff: read {baton} and follow its instructions."
     alias = "claude2" if account == "overflow" else "claude"
     ended = Path(tempfile.gettempdir()) / f"cc_handoff_{os.getpid()}.ended"
-    cmd = f"cd {shlex.quote(cwd)} && {alias} {shlex.quote(prompt)}; touch {shlex.quote(str(ended))}"
+    cmd = _launch_cmd(cwd, alias, prompt, ended)
     old_tty = subprocess.run(["ps", "-o", "tty=", "-p", str(pid)],
                              capture_output=True, text=True).stdout.strip()
     r = subprocess.run([OSASCRIPT, "-e", _open_like_script(cmd, "/dev/" + old_tty)],
@@ -447,6 +448,16 @@ def launch(pid, transcript):
     _log(f"OK {meta['project']} {meta['context_k']:.0f}k pid {pid} -> pid {new_pid} on {tty}; "
          f"loops {len(v['loops'])}; baton {baton}")
     return 0
+
+
+def _launch_cmd(cwd, alias, prompt, ended):
+    # ~/.zprofile opens every Terminal window in ~/Desktop/code, and Terminal
+    # only learns the cwd from update_terminal_cwd (/etc/zshrc_Apple_Terminal)
+    # at a prompt, so without the explicit call every title says "code". The
+    # braces keep claude gated on the cd: the claude alias contains a `;`,
+    # which would otherwise leave the `&&` guarding only its first half.
+    return (f"cd {shlex.quote(cwd)} && {{ update_terminal_cwd 2>/dev/null; "
+            f"{alias} {shlex.quote(prompt)}; }}; touch {shlex.quote(str(ended))}")
 
 
 def _open_like_script(cmd, old_tty):

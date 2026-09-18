@@ -7,6 +7,9 @@ real transcripts are, and scan() pre-filters raw lines on b'"type":"assistant"'.
 A spaced fixture would silently skip every line and read as idle.
 """
 import json
+import os
+import shlex
+import subprocess
 import sys
 import tempfile
 import time
@@ -193,6 +196,42 @@ def test_conversation_and_baton():
         assert out.name.endswith("_code-rog-gateway-auto-handoff.md")
         assert "CronCreate cron=`*/10 * * * *` recurring=true" in body and "TICK run x" in body
         assert "build the thing" in body and "real question" in body
+        assert "963k-context session in `/x`" in body and "3-line status" in body
+        assert "Re-create the loops" in body, "the baton, not the argv, carries the instructions"
+
+
+def test_launch_cmd_title_and_gate():
+    # Runs the real command line under zsh with the real claude alias shape
+    # (it contains a `;`), a stub claude on PATH and a stub update_terminal_cwd.
+    prompt = "Handoff: read /x/y.md and follow its instructions."
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d).resolve()
+        (d / "bin").mkdir()
+        proj = d / "my proj"
+        proj.mkdir()
+        fake = d / "bin" / "claude"
+        fake.write_text('#!/bin/sh\necho "$PWD|$#|$1" > "$OUT/ran"\n')
+        fake.chmod(0o755)
+
+        def run(cwd, tag):
+            out = d / tag
+            out.mkdir()
+            cmd = handoff._launch_cmd(str(cwd), "claude", prompt, out / "ended")
+            script = ("alias claude='unset ANTHROPIC_API_KEY; command claude'\n"
+                      'update_terminal_cwd() { echo "$PWD" > "$OUT/title"; }\n'
+                      f"eval {shlex.quote(cmd)}\n")
+            subprocess.run(["/bin/zsh", "-f", "-c", script], capture_output=True, timeout=10,
+                           env={**os.environ, "OUT": str(out), "PATH": f"{d / 'bin'}:/usr/bin:/bin"})
+            return out
+
+        out = run(proj, "ok")
+        title, ran = out / "title", out / "ran"
+        assert title.exists() and title.read_text().strip() == str(proj), "Terminal must hear about the cd"
+        assert ran.exists() and ran.read_text().strip() == f"{proj}|1|{prompt}"
+        assert (out / "ended").exists()
+        out = run(d / "gone", "bad")
+        assert not (out / "ran").exists(), "claude must not start in the wrong dir"
+        assert (out / "ended").exists(), "the launcher still learns the window is done"
 
 
 def test_annotate_and_one_threshold():
