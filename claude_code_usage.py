@@ -212,6 +212,21 @@ def _severity_band(out):
         out["band"] = "ok"
 
 
+def _local_servers_snapshot():
+    """Local dev servers our sessions left running (2026-09-27): count plus the stale ones the
+    widget's stop button clears. Imported from deploy/local_cleanup.py, the one implementation that
+    every deploy also runs. Degrades to None instead of breaking the widget."""
+    try:
+        import sys as _sys
+        _lc = str(Path(__file__).resolve().parent.parent / "deploy")
+        if _lc not in _sys.path:
+            _sys.path.insert(0, _lc)
+        import local_cleanup
+        return local_cleanup.snapshot()
+    except Exception:
+        return None
+
+
 def _mac_health_snapshot():
     """Cheap Mac vitals for the widget (load avg, hot procs, top hog, RAM%).
 
@@ -3142,6 +3157,7 @@ def main():
         print(json.dumps({
             "accounts": accounts_payload,
             "mac": _mac_health_snapshot(),
+            "local": _local_servers_snapshot(),
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "updated_pt": datetime.now(timezone.utc).astimezone(PT).strftime("%-I:%M%p").lower(),
         }))

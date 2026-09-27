@@ -14,6 +14,7 @@
 // are otherwise unchanged from what shipped.
 
 import { run } from "uebersicht"
+import { LocalChip } from "./cc-usage.local.jsx"
 import { clamp, paceClass, paceBgClass } from "./cc-usage.format.jsx"
 import { OVERFLOW_RENEWAL_DATE, OVERFLOW_DOWNGRADE_SCHEDULED,
          renewalDaysLeft } from "./cc-usage.config.jsx"
@@ -291,6 +292,7 @@ export const StandbyRow = ({ standby, primary, overflow, active, d,
                         {m.chrome_reapable_gb.toFixed(1)}G
                       </span>,
                     ]}
+                    <LocalChip l={d.local} />
                     <span className="dot">·</span>
                     <span
                       className={"macBtn "
