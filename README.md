@@ -37,6 +37,11 @@ so you don't have to ask.
 
 ---
 
+## Codex companion
+
+The dashboard also tracks Codex quota, pacing, and local daily/project/model
+usage. See [CODEX.md](CODEX.md) for data coverage, counting rules, and setup.
+
 ## Features
 
 ### 1. Always-on menu bar widget
@@ -77,8 +82,9 @@ Claude Code window — one block per open project — with a mini fill bar
 against the 1M context ceiling (the `context-1m-2025-08-07` beta),
 sorted worst-first. At a glance you can see which open window is about
 to hit auto-compact so you can `/handoff` on your own terms instead of
-letting the lossy summary fire. Thresholds: neutral below 60% fill,
-amber at 60–80%, underlined white with a `⚠ HANDOFF` flag at 80%+. The
+letting the lossy summary fire. Thresholds: neutral below 500k, amber
+from 500k with a `▶ handoff` button once the window is idle, underlined
+white from 800k. The
 scanner reads both `~/.claude/projects/` and `~/.claude-alt/projects/`,
 so windows open under either account of a multi-account setup all show
 up together.

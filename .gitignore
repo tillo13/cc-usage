@@ -50,3 +50,10 @@ dist/
 # are byte-duplicates of shipped files. Committing them to a public repo
 # publishes stale copies that someone later edits by mistake.
 ubersicht/_antiquated_widget_copies/
+
+# Codex collector state (contains private local project names).
+data/codex_usage.json
+data/codex_usage.tmp
+data/.codex_usage.lock
+data/codex_usage.log
+data/com.cc-usage.codex.plist

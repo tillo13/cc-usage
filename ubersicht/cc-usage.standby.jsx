@@ -57,7 +57,7 @@ export const StandbyRow = ({ standby, primary, overflow, active, d,
           if (onFumes) {
             // ── FUMES MODE: both accounts running low ──
             return (
-              <div className="row row2">
+              <div className="row row2 standbyStrip">
                 <div className="card cardInline">
                   <span className="lbl warn">
                     {overflowCapped ? "both capped" : "running low"}
@@ -119,7 +119,7 @@ export const StandbyRow = ({ standby, primary, overflow, active, d,
           const migrateUrgent = stbWeekQ >= 97
           const migrateClass = migrateUrgent ? "nudgeUrgent" : "nudge"
           return (
-            <div className="row row2">
+            <div className="row row2 standbyStrip">
               <div className="card cardInline">
                 <span className="lbl">{stbLabel.toLowerCase()} <span className="lblDim">· capped</span></span>
                 <span className="val">
@@ -192,15 +192,13 @@ export const StandbyRow = ({ standby, primary, overflow, active, d,
           : capHours < 12 ? "warn"
           : "good"
         return (
-          <div className="row row2">
+          <div className="row row2 standbyStrip">
             {/* overflow collapsed to a dim one-liner — post-SpaceX it's a Pro
                emergency spare, not a daily driver (see CLAUDE.md account-tiers).
                The capped-mode bridge branch above is intentionally untouched. */}
             <div className="card cardInline">
               <span className="lbl lblDim">{stbLabel.toLowerCase()} <span className="lblDim">· spare</span></span>
               <span className="val">
-                <span className="hint">Pro · emergency only</span>
-                <span className="dot">·</span>
                 <span className="unit">sess</span>
                 <span className={paceClass(stbSessDelta)}>{stbSessQ.toFixed(0)}%</span>
                 <span className="dot">·</span>
@@ -309,7 +307,7 @@ export const StandbyRow = ({ standby, primary, overflow, active, d,
                         + ". Click to launch smart_mac_cleaner.py in a new Terminal tab."
                         : "Nothing needs cleaning. Click to run smart_mac_cleaner.py anyway."}
                     >
-                      ▶ run smart_mac_cleaner
+                      ▶ clean
                     </span>
                   </span>
 
@@ -392,7 +390,7 @@ export const OverflowNotice = () => {
         const colorClass = urgent ? "warn" : "hint"
         const scheduled = OVERFLOW_DOWNGRADE_SCHEDULED
         return (
-          <div className="row row2">
+          <div className="row row2 standbyStrip">
             <div className="card cardInline">
               <span className={"lbl " + (urgent ? "warn" : "")}>
                 {scheduled ? "claude2 → pro" : "claude2 renewal"}

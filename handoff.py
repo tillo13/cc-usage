@@ -31,9 +31,13 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-# The one handoff threshold: the context-compaction skill's 180k, the LIVE
-# card's HANDOFF band (claude_code_usage._classify_session) and the button.
-HANDOFF_CTX_TOKENS = 180_000
+# The one handoff threshold: the context-compaction skill, the LIVE card's
+# HANDOFF band (claude_code_usage._classify_session) and the button. 180k on
+# 2026-09-18 was a leftover from the 200k-context era; windows start at ~55k,
+# so it tripped after a median 10 prompts. As of 2026-09-19 (30d, 181 sessions)
+# calls past 500k were 32% of main-thread calls but 56% of weighted burn, and
+# a simulated handoff at 500k kept ~70% of the saving 180k would have.
+HANDOFF_CTX_TOKENS = 500_000
 
 HERE = Path(__file__).resolve().parent
 CACHE_PATH = HERE / "data" / ".handoff_scan_cache.json"

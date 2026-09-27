@@ -246,15 +246,19 @@ Claude Code window with a mini fill bar against the 1M context ceiling
 always-visible "which open window is about to compact" readout so they
 can `/handoff` on their own terms instead of letting auto-compact fire.
 
-Thresholds (changed 2026-09-18): ONE handoff number,
-`handoff.HANDOFF_CTX_TOKENS` = 180k, shared by the context-compaction skill,
+Thresholds (as of 2026-09-19): ONE handoff number,
+`handoff.HANDOFF_CTX_TOKENS` = 500k, shared by the context-compaction skill,
 the LIVE card's HANDOFF band (`_classify_session`) and this strip. The bar
-still draws against 1M, but its color is the session's band: amber from 180k,
-underlined white from 280k. (Until 2026-09-18 the strip flagged at 65% of 1M,
-i.e. 650k, while its own rationale said cost climbs past 150k. That week the
-fattest windows ran to 963k.)
+still draws against 1M, but its color is the session's band: amber from 500k,
+underlined white from 800k. History: 650k (65% of 1M) until 2026-09-18, then
+180k for one day. 180k was the context-compaction skill's number from the
+200k-context era; every window starts at ~55k, so it tripped after a median
+10 prompts and showed on 76% of sessions. 30-day measurement behind 500k:
+calls past 500k were 32% of main-thread calls but 56% of weighted burn, and a
+simulated handoff at 500k kept ~70% of the saving 180k would have (see the
+`handoff.py` constant's comment).
 
-Past 180k each Mac window shows `HandoffChip` (`ubersicht/cc-usage.handoff.jsx`):
+Past 500k each Mac window shows `HandoffChip` (`ubersicht/cc-usage.handoff.jsx`):
   busy  → the reason as text ("busy: working", "busy: 2 bg tasks", "busy:
           waiting on a tool", "busy: input queued"). No button.
   idle  → a pulsing "▶ handoff" button. Click runs `handoff.py launch`:
@@ -276,7 +280,7 @@ only when a `<task-notification>` WITH `<status>` names it; Monitor events
 carry no status), nothing queued after the last reply. CronCreate /
 ScheduleWakeup loops don't block: they're session-only, so the baton
 carries them and the new session re-arms them (the old one's die with it).
-The scan runs only for windows over 180k and is cached by (size, mtime) in
+The scan runs only for windows over 500k and is cached by (size, mtime) in
 `data/.handoff_scan_cache.json`. Clicks log to `data/handoff.log`; refusals
 also pop a macOS notification. ROG windows have no pid, so they keep a plain
 "⚠ handoff" flag. Tests: `tests/test_handoff.py` (plain python, FDA venv).

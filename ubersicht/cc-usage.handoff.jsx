@@ -2,7 +2,7 @@
 //
 // Python (handoff.annotate) tags each live Mac window with
 // `handoff = { over, ready, reason, loops }`. Over the one handoff threshold
-// (180k, handoff.HANDOFF_CTX_TOKENS):
+// (500k, handoff.HANDOFF_CTX_TOKENS):
 //   ready  → a pulsing "▶ handoff" button, same shape as the mac cleaner's.
 //            Click runs handoff.py launch: re-checks idle, writes a baton to
 //            ~/.claude/handoffs/, opens a fresh Terminal window in the same

@@ -66,6 +66,7 @@
 // shell commands (e.g. the macBtn that launches smart_mac_cleaner).
 import { run } from "uebersicht"
 import { StandbyRow, OverflowNotice } from "./cc-usage.standby.jsx"
+import { CodexRow } from "./cc-usage.codex.jsx"
 import { HandoffChip } from "./cc-usage.handoff.jsx"
 import { PYTHON_BIN, REPO_ROOT, OVERFLOW_RENEWAL_DATE,
          OVERFLOW_DOWNGRADE_SCHEDULED, renewalDaysLeft }
@@ -136,6 +137,7 @@ export const render = ({ output, error }) => {
     return (
       <div className="bar">
         <div className="row"><span className="lbl">CLAUDE CODE</span><span className="val hint">loading…</span></div>
+        <CodexRow data={d.codex} />
       </div>
     )
   }
@@ -305,8 +307,9 @@ export const render = ({ output, error }) => {
   // Re-rank the active sessions by fill %, worst-first. The bar still draws
   // against the 1M ceiling, but the color is the session's cost band, so the
   // strip, the LIVE card and the handoff button share one threshold: warn
-  // from 180k (handoff.HANDOFF_CTX_TOKENS), crit from 280k. Until 2026-09-18
-  // the strip flagged at 65% of 1M (650k), long after cost had climbed.
+  // from 500k (handoff.HANDOFF_CTX_TOKENS), crit from 800k. History: 650k
+  // (65% of 1M) until 2026-09-18, then 180k for a day, which tripped after a
+  // median 10 prompts because every window starts at ~55k.
   const CONTEXT_CAP = 1_000_000
   const winSorted = liveSessions
     .map((s) => {
@@ -323,10 +326,11 @@ export const render = ({ output, error }) => {
       {/* ════════════════════════════════════════════════════════════
            ROW 0 — WINDOWS STRIP (context fill of 1M)
            Horizontal list of every currently-active Claude Code window
-           with a mini fill bar against the 1M context ceiling. Past 180k a
+           with a mini fill bar against the 1M context ceiling. Past 500k a
            window gets a ▶ handoff button once it's idle, or its busy reason
            while it isn't (HandoffChip, cc-usage.handoff.jsx).
          ════════════════════════════════════════════════════════════ */}
+      <div className="topBand">
       {winSorted.length > 0 && (
         <div className="row winStrip">
           <span className="winStripLbl">
@@ -357,12 +361,19 @@ export const render = ({ output, error }) => {
           ))}
         </div>
       )}
+      <StandbyRow
+        standby={standby} primary={primary} overflow={overflow}
+        active={active} d={d} standbyIsPrimary={standbyIsPrimary}
+        weekQuotaPct={weekQuotaPct} weekTimePct={weekTimePct}
+        weekDelta={weekDelta}
+      />
+      </div>
 
       {/* ════════════════════════════════════════════════════════════
            ROW 1 — PRIMARY CLOCKS
            [CC · TARGET]  │  [SESSION 5H]  │  [WEEK 168H]  │  [updated]
          ════════════════════════════════════════════════════════════ */}
-      <div className="row">
+      <div className="row primaryRow">
 
         {/* IDENTITY — leads with the $ gate, the constraint that actually binds
             post-SpaceX (May 2026 limit increases made weekly quota non-scarce —
@@ -697,7 +708,7 @@ export const render = ({ output, error }) => {
            ROW 2 — SUPPORTING INSTRUMENTS
            [DAYS sparkline]  │  [SAFE PACE]  │  [TODAY]  │  [EXTRA $]
          ════════════════════════════════════════════════════════════ */}
-      <div className="row row2">
+      <div className="row row2 activityRow">
 
         {/* DAYS — 8-column sparkline of active hours since weekly reset */}
         <div className="card cardInline">
@@ -860,9 +871,9 @@ export const render = ({ output, error }) => {
                 sunk. A 500-turn / 60k session is cheap to continue; a
                 40-turn / 350k session is expensive.
                 {"\n"}  FRESH    &lt;60k ctx    &lt;$0.03/reply
-                {"\n"}  NORMAL   60–180k      $0.03–$0.09/reply
-                {"\n"}  HANDOFF  180–280k     $0.09–$0.14/reply
-                {"\n"}  COMPACT  280k+        &gt;$0.14/reply  ← act
+                {"\n"}  NORMAL   60–500k      $0.03–$0.25/reply
+                {"\n"}  HANDOFF  500–800k     $0.25–$0.40/reply
+                {"\n"}  COMPACT  800k+        &gt;$0.40/reply  ← act
                 {"\n\n"}Costs assume Opus cache-read at $0.50/mtok. Each
                 reply pays this FLOOR just to re-read history; thinking,
                 new input, and tool output are extra on top.
@@ -911,8 +922,6 @@ export const render = ({ output, error }) => {
         </div>
 
 
-      </div>
-
       {/* ════════════════════════════════════════════════════════════
            ROW 2.5 — BURN CONTRIBUTORS (last 24h)
            Mirrors `claude /usage` "what's contributing" panel. Helps
@@ -929,7 +938,7 @@ export const render = ({ output, error }) => {
         ].filter(b => b.key === "ctx" || b.pct > 0)   // keep ctx always (the real lever); drop 0% noise
         const dominantPct = Math.max(...bands.map(b => b.pct))
         return (
-          <div className="row row2 contribStrip">
+          <div className="contribStrip">
             <div className="card cardInline">
               <span className="lbl">contrib · 24h</span>
               {bands.map(b => {
@@ -963,13 +972,11 @@ export const render = ({ output, error }) => {
         )
       })()}
 
-      {/* ROW 3 — standby account strip + mac vitals (see cc-usage.standby.jsx) */}
-      <StandbyRow
-        standby={standby} primary={primary} overflow={overflow}
-        active={active} d={d} standbyIsPrimary={standbyIsPrimary}
-        weekQuotaPct={weekQuotaPct} weekTimePct={weekTimePct}
-        weekDelta={weekDelta}
-      />
+      </div>
+
+      {/* Codex allowance + local activity */}
+
+      <CodexRow data={d.codex} />
       <OverflowNotice />
 
     </div>

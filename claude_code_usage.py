@@ -62,6 +62,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import claude_usage_db as dbmod  # noqa: E402
 import handoff  # noqa: E402
+import codex_usage  # noqa: E402
 
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 USER_AGENT = "claude-cli/2.1.101 (external, cli)"
@@ -1438,21 +1439,21 @@ def _classify_session(turns, context_k):
 
     Thresholds map directly to $/reply at Opus cache-read pricing:
         <60k   → <$0.03/reply   → FRESH   (good)    · cheap, keep going
-        60–180 → $0.03–0.09     → NORMAL  (hint)    · typical median session
-        180–280→ $0.09–0.14     → HANDOFF (warn)    · the ▶ handoff button shows
-        280+   → >$0.14/reply   → COMPACT (crit)    · every reply costs real $
+        60–500 → $0.03–0.25     → NORMAL  (hint)    · typical session
+        500–800→ $0.25–0.40     → HANDOFF (warn)    · the ▶ handoff button shows
+        800+   → >$0.40/reply   → COMPACT (crit)    · every reply costs real $
 
-    The HANDOFF edge is handoff.HANDOFF_CTX_TOKENS (was 150k until 2026-09-18),
-    shared with the context-compaction skill's 180k and the widget button so
-    there is one handoff number, not three.
+    The HANDOFF edge is handoff.HANDOFF_CTX_TOKENS, shared with the
+    context-compaction skill and the widget button so there is one handoff
+    number, not three. It was 150k until 2026-09-18, 180k until 2026-09-19.
 
-    Distribution context from the 7-day study: p50=118k (NORMAL mid),
-    p95=424k (deep COMPACT), p99=594k (very deep COMPACT). The bands are
-    calibrated so the median session sits comfortably in NORMAL and the
-    outliers that actually drive weekly burn are the ones nudged.
+    As of 2026-09-19 (30d, 181 sessions): windows start at ~55k, peak
+    p50=392k / p75=674k / p90=916k, and calls past 500k carried 56% of
+    weighted main-thread burn. The bands leave the median session in NORMAL
+    and nudge the long tail that actually drives weekly burn.
     """
     c = context_k or 0
-    if c >= 280:
+    if c >= 800:
         return "crit", "COMPACT"
     if c >= handoff.HANDOFF_CTX_TOKENS / 1000:
         return "warn", "HANDOFF"
@@ -3156,6 +3157,7 @@ def main():
 
         print(json.dumps({
             "accounts": accounts_payload,
+            "codex": codex_usage.cached_payload(),
             "mac": _mac_health_snapshot(),
             "local": _local_servers_snapshot(),
             "updated_at": datetime.now(timezone.utc).isoformat(),

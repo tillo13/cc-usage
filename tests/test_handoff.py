@@ -236,20 +236,22 @@ def test_launch_cmd_title_and_gate():
 
 def test_annotate_and_one_threshold():
     idle = write([END])
-    s = {"context_tokens": 179_999}
+    s = {"context_tokens": 499_999}
     handoff.annotate(s, idle, 123, None)
-    assert s["handoff"] == {"over": False, "threshold_k": 180}
-    s = {"context_tokens": 180_000}
+    assert s["handoff"] == {"over": False, "threshold_k": 500}
+    s = {"context_tokens": 500_000}
     handoff.annotate(s, idle, 123, None)
     assert s["handoff"]["ready"] is True
-    s = {"context_tokens": 500_000}
+    s = {"context_tokens": 600_000}
     handoff.annotate(s, idle, None, None)
     assert s["handoff"]["ready"] is False, "no pid, nothing to end"
-    s = {"context_tokens": 500_000}
+    s = {"context_tokens": 600_000}
     handoff.annotate(s, "/nonexistent.jsonl", 1, None)
     assert s["handoff"]["reason"] == "state unknown", "render path must not raise"
-    assert ccu._classify_session(1, 179.9)[1] == "NORMAL"
-    assert ccu._classify_session(1, 180.0)[1] == "HANDOFF"
+    assert ccu._classify_session(1, 499.9)[1] == "NORMAL"
+    assert ccu._classify_session(1, 500.0)[1] == "HANDOFF"
+    assert ccu._classify_session(1, 799.9)[1] == "HANDOFF"
+    assert ccu._classify_session(1, 800.0)[1] == "COMPACT"
 
 
 def test_one_launch_at_a_time():

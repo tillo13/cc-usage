@@ -63,10 +63,10 @@ export const className = `
       rgba(184, 200, 224, 0.22) 85%,
       rgba(184, 200, 224, 0) 100%
     );
-    margin: 0 16px;
+    margin: 0 10px;
     flex-shrink: 0;
   }
-  .row2 .rule { height: 14px; margin: 0 14px; }
+  .row2 .rule { height: 14px; margin: 0 10px; }
 
   /* CARD — row-1 variant stacks label over value. */
   .card {
@@ -392,7 +392,81 @@ export const className = `
     width: 8px;
     background: rgba(74, 227, 255, 0.55);
   }
-  .contribStrip { margin-top: 2px; }
+  /* Four compact bands: windows + system, Claude quota, activity, Codex.
+     Cards wrap at smaller widths without hiding warnings or handoff controls. */
+  .topBand {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    column-gap: 12px;
+    padding: 0 22px;
+    min-height: 20px;
+    border-bottom: 1px solid rgba(74, 227, 255, 0.10);
+  }
+  .topBand .winStrip {
+    flex: 0 1 auto;
+    min-width: 0;
+    height: auto;
+    min-height: 20px;
+    padding: 0 3px;
+    border: 0;
+    flex-wrap: wrap;
+    gap: 3px 10px;
+    overflow: visible;
+  }
+  .topBand .standbyStrip {
+    margin-left: 0;
+    padding: 0;
+    border: 0;
+    height: auto;
+    min-height: 20px;
+    flex-wrap: wrap;
+    gap: 4px 12px;
+  }
+  .topBand .standbyStrip .cardInline { gap: 6px; }
+  .topBand .winStrip + .standbyStrip > .card:first-child,
+  .topBand .standbyStrip > .card + .card {
+    border-left: 1px solid rgba(184, 200, 224, 0.24);
+    padding-left: 12px;
+  }
+  .primaryRow {
+    height: auto;
+    min-height: 26px;
+    flex-wrap: wrap;
+    row-gap: 3px;
+  }
+  .activityRow {
+    height: auto;
+    min-height: 23px;
+    flex-wrap: wrap;
+    row-gap: 4px;
+    padding-top: 2px;
+    padding-bottom: 2px;
+  }
+  .contribStrip {
+    margin: 0 0 0 10px;
+    padding-left: 10px;
+    border-left: 1px solid rgba(184, 200, 224, 0.24);
+  }
+  .contribStrip .tip { left: auto; right: -6px; }
+  .contribStrip .cardInline { gap: 4px; }
+  .contribStrip .contribBand { margin-left: 5px; }
+  .codexRow {
+    height: auto;
+    min-height: 23px;
+    flex-wrap: wrap;
+    gap: 4px 0;
+    padding-top: 1px;
+    padding-bottom: 1px;
+  }
+  .codexRow .cardInline { gap: 8px; }
+  .codexRow > .card:not(:first-child) {
+    margin-left: 10px;
+    padding-left: 10px;
+    border-left: 1px solid rgba(184, 200, 224, 0.24);
+  }
+  .codexRow .card:last-child .tip { left: auto; right: -6px; }
+
   .contribBand {
     display: inline-flex;
     align-items: baseline;
@@ -433,7 +507,9 @@ export const className = `
 
   /* ═══ Updated time with live pulse ═══ */
   .updated {
-    margin-left: auto;
+    margin-left: 12px;
+    padding-left: 12px;
+    border-left: 1px solid rgba(184, 200, 224, 0.24);
     display: flex;
     align-items: center;
     gap: 7px;
