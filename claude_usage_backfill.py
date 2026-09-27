@@ -66,7 +66,24 @@ ACCOUNT_GLOBS = [
     ("overflow", "mac", os.path.expanduser("~/.claude-alt/projects/*/*.jsonl")),
     ("overflow", "mac", os.path.expanduser("~/.claude-alt/sessions/*.jsonl")),
     ("primary",  "rog", os.path.expanduser("~/.claude-rog/projects/*/*.jsonl")),
+    # Subagent transcripts sit one level down, projects/<proj>/<session>/subagents/agent-*.jsonl,
+    # with the agent's type in a sibling agent-*.meta.json. Until 2026-09-27 no glob reached them,
+    # so subagent turns were never counted and is_sidechain read 0 on every row.
+    ("primary",  "mac", os.path.expanduser("~/.claude/projects/*/*/subagents/*.jsonl")),
+    ("overflow", "mac", os.path.expanduser("~/.claude-alt/projects/*/*/subagents/*.jsonl")),
+    ("primary",  "rog", os.path.expanduser("~/.claude-rog/projects/*/*/subagents/*.jsonl")),
 ]
+
+
+def _agent_type(path):
+    """agentType from a subagent transcript's sibling .meta.json, else None."""
+    if os.sep + "subagents" + os.sep not in path:
+        return None
+    try:
+        with open(path[:-len(".jsonl")] + ".meta.json", encoding="utf-8") as f:
+            return json.load(f).get("agentType")
+    except (OSError, ValueError):
+        return None
 
 # Trim tool_use input payloads to this size before storing. Keeps DB small
 # while still preserving enough to answer "what did I Grep for most often"
@@ -464,6 +481,7 @@ def backfill(since=None, verbose=True):
 
     for i, (path, account, host) in enumerate(files, 1):
         merger = _TurnMerger(_write)
+        agent_type = _agent_type(path)
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as f:
                 for line in f:
@@ -475,6 +493,8 @@ def backfill(since=None, verbose=True):
                     except json.JSONDecodeError:
                         continue
                     counts["entries"] += 1
+                    if agent_type and not entry.get("agentType"):
+                        entry["agentType"] = agent_type
                     rows = _dispatch(entry, path, account=account, host=host)
                     if entry.get("type") == "assistant" and rows:
                         # rows[0] is the turns row, the rest are tool_calls.
